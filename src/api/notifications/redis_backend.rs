@@ -28,7 +28,7 @@ mod redis_impl {
     use crate::{db::models::{UserId, AuthRequestId}, CONFIG};
     use super::backends::{WebSocketBackend, AnonymousWebSocketBackend};
 
-    const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+
     const USER_CONNECTIONS_PREFIX: &str = "vw:ws:users:";
     const ANONYMOUS_CONNECTIONS_PREFIX: &str = "vw:ws:anon:";
     const PUBSUB_CHANNEL_PREFIX: &str = "vw:ws:msg:";
@@ -42,6 +42,8 @@ mod redis_impl {
         // Local storage for active WebSocket senders on this instance
         local_connections: LocalConnections,
         _pubsub_task: Arc<tokio::task::JoinHandle<()>>,
+        redis_timeout: Duration,
+        fallback_to_memory: bool,
     }
 
     impl RedisWebSocketBackend {
@@ -50,6 +52,10 @@ mod redis_impl {
             let manager = ConnectionManager::new(client.clone()).await?;
             let local_connections = Arc::new(RwLock::new(HashMap::new()));
             
+            // Get config values once during initialization
+            let redis_timeout = Duration::from_secs(CONFIG.redis_websocket_timeout());
+            let fallback_to_memory = CONFIG.redis_websocket_fallback_memory();
+            
             // Start pubsub listener task
             let pubsub_connections = Arc::clone(&local_connections);
             let pubsub_client = client.clone();
@@ -57,12 +63,15 @@ mod redis_impl {
                 Self::pubsub_listener(pubsub_client, pubsub_connections).await;
             });
 
-            info!("Redis WebSocket backend initialized");
+            info!("Redis WebSocket backend initialized with {}s timeout, fallback: {}", 
+                  redis_timeout.as_secs(), fallback_to_memory);
             
             Ok(Self {
                 redis_manager: Arc::new(manager),
                 local_connections,
                 _pubsub_task: Arc::new(pubsub_task),
+                redis_timeout,
+                fallback_to_memory,
             })
         }
 
@@ -134,7 +143,7 @@ mod redis_impl {
         }
 
         async fn get_user_connections(&self, user_id: &UserId) -> RedisResult<Vec<Uuid>> {
-            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+            let mut conn = timeout(self.redis_timeout, self.redis_manager.clone().get_async_connection()).await
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
             let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
@@ -150,7 +159,7 @@ mod redis_impl {
         }
 
         async fn add_user_connection(&self, user_id: &UserId, entry_uuid: Uuid) -> RedisResult<()> {
-            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+            let mut conn = timeout(self.redis_timeout, self.redis_manager.clone().get_async_connection()).await
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
             let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
@@ -168,7 +177,7 @@ mod redis_impl {
         }
 
         async fn remove_user_connection(&self, user_id: &UserId, entry_uuid: Uuid) -> RedisResult<()> {
-            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+            let mut conn = timeout(self.redis_timeout, self.redis_manager.clone().get_async_connection()).await
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
             let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
@@ -177,7 +186,7 @@ mod redis_impl {
         }
 
         async fn publish_update(&self, user_id: &UserId, data: &[u8]) -> RedisResult<()> {
-            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+            let mut conn = timeout(self.redis_timeout, self.redis_manager.clone().get_async_connection()).await
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
             let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
@@ -232,7 +241,7 @@ mod redis_impl {
                 error!("Failed to register WebSocket connection in Redis: {}", e);
                 
                 // Fallback: remove from local connections if Redis fails
-                if CONFIG.redis_websocket_fallback_memory() {
+                if self.fallback_to_memory {
                     let mut connections = self.local_connections.write().await;
                     connections.remove(&entry_uuid);
                 }
@@ -258,7 +267,7 @@ mod redis_impl {
                 error!("Failed to publish WebSocket update to Redis: {}", e);
                 
                 // Fallback to local connections only if configured
-                if CONFIG.redis_websocket_fallback_memory() {
+                if self.fallback_to_memory {
                     warn!("Falling back to local WebSocket connections only");
                     let connections = self.local_connections.read().await;
                     for (_, sender) in connections.iter() {
@@ -276,6 +285,8 @@ mod redis_impl {
         redis_manager: Arc<ConnectionManager>,
         local_connections: Arc<RwLock<HashMap<String, Sender<Message>>>>,
         _pubsub_task: Arc<tokio::task::JoinHandle<()>>,
+        redis_timeout: Duration,
+        fallback_to_memory: bool,
     }
 
     impl RedisAnonymousWebSocketBackend {
@@ -284,6 +295,10 @@ mod redis_impl {
             let manager = ConnectionManager::new(client.clone()).await?;
             let local_connections = Arc::new(RwLock::new(HashMap::new()));
             
+            // Get config values once during initialization  
+            let redis_timeout = Duration::from_secs(CONFIG.redis_websocket_timeout());
+            let fallback_to_memory = CONFIG.redis_websocket_fallback_memory();
+            
             // Start pubsub listener for anonymous connections
             let pubsub_connections = Arc::clone(&local_connections);
             let pubsub_client = client.clone();
@@ -291,12 +306,15 @@ mod redis_impl {
                 Self::pubsub_listener(pubsub_client, pubsub_connections).await;
             });
 
-            info!("Redis anonymous WebSocket backend initialized");
+            info!("Redis anonymous WebSocket backend initialized with {}s timeout, fallback: {}", 
+                  redis_timeout.as_secs(), fallback_to_memory);
             
             Ok(Self {
                 redis_manager: Arc::new(manager),
                 local_connections,
                 _pubsub_task: Arc::new(pubsub_task),
+                redis_timeout,
+                fallback_to_memory,
             })
         }
 
@@ -357,7 +375,7 @@ mod redis_impl {
         }
 
         async fn add_anonymous_connection(&self, token: &str) -> RedisResult<()> {
-            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+            let mut conn = timeout(self.redis_timeout, self.redis_manager.clone().get_async_connection()).await
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
             let key = format!("{}{}", ANONYMOUS_CONNECTIONS_PREFIX, token);
@@ -366,7 +384,7 @@ mod redis_impl {
         }
 
         async fn remove_anonymous_connection(&self, token: &str) -> RedisResult<()> {
-            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+            let mut conn = timeout(self.redis_timeout, self.redis_manager.clone().get_async_connection()).await
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
             let key = format!("{}{}", ANONYMOUS_CONNECTIONS_PREFIX, token);
@@ -375,7 +393,7 @@ mod redis_impl {
         }
 
         async fn publish_anonymous_update(&self, token: &str, data: &[u8]) -> RedisResult<()> {
-            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+            let mut conn = timeout(self.redis_timeout, self.redis_manager.clone().get_async_connection()).await
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
             let channel = format!("{}{}", ANONYMOUS_PUBSUB_CHANNEL_PREFIX, token);
@@ -401,7 +419,7 @@ mod redis_impl {
                 error!("Failed to register anonymous WebSocket connection in Redis: {}", e);
                 
                 // Fallback: remove from local connections if Redis fails
-                if CONFIG.redis_websocket_fallback_memory() {
+                if self.fallback_to_memory {
                     let mut connections = self.local_connections.write().await;
                     connections.remove(token);
                 }
@@ -427,7 +445,7 @@ mod redis_impl {
                 error!("Failed to publish anonymous WebSocket update to Redis: {}", e);
                 
                 // Fallback to local connection only if configured
-                if CONFIG.redis_websocket_fallback_memory() {
+                if self.fallback_to_memory {
                     warn!("Falling back to local anonymous WebSocket connection only");
                     let connections = self.local_connections.read().await;
                     if let Some(sender) = connections.get(token) {

@@ -422,10 +422,16 @@ make_config! {
     redis_websockets: _enable_redis_websockets {
         /// Enable Redis-based WebSocket backend
         _enable_redis_websockets:       bool,   false,  def,    false;
-        /// Redis WebSocket backend URL
+        /// Redis WebSocket backend URL. Supports authentication and TLS:
+        /// - Basic: redis://localhost:6379/1
+        /// - With AUTH: redis://:password@localhost:6379/1 
+        /// - With TLS: rediss://username:password@localhost:6380/1
+        /// - TLS with cert validation: rediss://user:pass@localhost:6380/1?tls_insecure=false
         redis_websocket_url:            String, false,  def,    "redis://localhost:6379/1".to_string();
         /// Redis WebSocket connection pool size
         redis_websocket_pool_size:      u32,    false,  def,    10;
+        /// Redis operation timeout in seconds
+        redis_websocket_timeout:        u64,    false,  def,    5;
         /// Fallback to memory backend on Redis failure
         redis_websocket_fallback_memory: bool,  false,  def,    true;
     },

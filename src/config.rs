@@ -418,6 +418,17 @@ make_config! {
         /// Enable websocket notifications
         enable_websocket:       bool,   false,  def,    true;
     },
+    /// Redis WebSocket settings (Experimental)
+    redis_websockets: _enable_redis_websockets {
+        /// Enable Redis-based WebSocket backend
+        _enable_redis_websockets:       bool,   false,  def,    false;
+        /// Redis WebSocket backend URL
+        redis_websocket_url:            String, false,  def,    "redis://localhost:6379/1".to_string();
+        /// Redis WebSocket connection pool size
+        redis_websocket_pool_size:      u32,    false,  def,    10;
+        /// Fallback to memory backend on Redis failure
+        redis_websocket_fallback_memory: bool,  false,  def,    true;
+    },
     push {
         /// Enable push notifications
         push_enabled:           bool,   false,  def,    false;

@@ -41,7 +41,7 @@ fn main() {
     compile_error!("Query Logging is only allowed during development, it is not intended for production usage!");
 
     #[cfg(all(not(debug_assertions), feature = "redis-websockets"))]
-    compile_error!("Redis WebSockets is experimental and should be used with caution.");
+    compile_error!("Redis WebSockets is experimental. Use at your own risk!");
 
     // Support $BWRS_VERSION for legacy compatibility, but default to $VW_VERSION.
     // If neither exist, read from git.

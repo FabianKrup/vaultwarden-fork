@@ -63,6 +63,8 @@ pub fn routes() -> Vec<Route> {
         get_diagnostics_config,
         resend_user_invite,
         get_diagnostics_http,
+        #[cfg(feature = "redis-websockets")]
+        get_diagnostics_redis,
     ]
 }
 
@@ -719,6 +721,10 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) 
         "ip_header_config": &CONFIG.ip_header(),
         "uses_proxy": uses_proxy,
         "enable_websocket": &CONFIG.enable_websocket(),
+        #[cfg(redis_websockets)]
+        "redis_websocket_enabled": &CONFIG._enable_redis_websockets(),
+        #[cfg(not(redis_websockets))]
+        "redis_websocket_enabled": false,
         "db_type": *DB_TYPE,
         "db_version": get_sql_server_version(&mut conn).await,
         "admin_url": format!("{}/diagnostics", admin_url()),
@@ -744,6 +750,47 @@ fn get_diagnostics_config(_token: AdminToken) -> Json<Value> {
 #[get("/diagnostics/http?<code>")]
 fn get_diagnostics_http(code: u16, _token: AdminToken) -> EmptyResult {
     err_code!(format!("Testing error {code} response"), code);
+}
+
+#[cfg(feature = "redis-websockets")]
+#[get("/diagnostics/redis", format = "application/json")]
+async fn get_diagnostics_redis(_token: AdminToken) -> Json<Value> {
+    use crate::api::notifications::{WS_BACKEND, WS_ANONYMOUS_BACKEND};
+    use std::any::Any;
+    
+    if !CONFIG._enable_redis_websockets() {
+        return Json(json!({
+            "status": "disabled",
+            "message": "Redis WebSocket backend is not enabled"
+        }));
+    }
+    
+    // Try to downcast to Redis backends to get health info
+    let mut backend_health = json!({
+        "status": "unknown",
+        "message": "Unable to determine Redis backend health"
+    });
+    
+    // This is a bit of a hack to get health info from the trait objects
+    // In a real implementation, we might want to add health check methods to the traits
+    let backend_any = &**WS_BACKEND as &dyn Any;
+    if let Some(redis_backend) = backend_any.downcast_ref::<crate::api::notifications::redis_backend::RedisWebSocketBackend>() {
+        let health_info = redis_backend.get_health_info().await;
+        backend_health = json!({
+            "status": match health_info.status {
+                crate::api::notifications::redis_backend::RedisHealthStatus::Healthy => "healthy",
+                crate::api::notifications::redis_backend::RedisHealthStatus::Unhealthy => "unhealthy", 
+                crate::api::notifications::redis_backend::RedisHealthStatus::Unknown => "unknown",
+            },
+            "last_check": format!("{:.2?} ago", health_info.last_check.elapsed()),
+            "consecutive_failures": health_info.consecutive_failures,
+            "last_error": health_info.last_error,
+            "fallback_enabled": CONFIG.redis_websocket_fallback_memory(),
+            "health_check_interval": CONFIG.redis_websocket_health_check_interval(),
+        });
+    }
+    
+    Json(backend_health)
 }
 
 #[post("/config", format = "application/json", data = "<data>")]

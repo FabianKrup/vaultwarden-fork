@@ -1,76 +1,413 @@
-// Future Redis backend implementation
-// TODO: Implement when Redis WebSocket support is ready
+/*!
+ * Redis WebSocket Backend Implementation
+ * 
+ * This provides a Redis-based implementation for WebSocket connections,
+ * enabling horizontal scaling of Vaultwarden instances.
+ * 
+ * The implementation uses:
+ * - Redis Pub/Sub for message broadcasting
+ * - Redis Hash Maps for connection tracking
+ * - Local MPSC channels for WebSocket message delivery
+ */
 
-#[allow(dead_code)]
 #[cfg(feature = "redis-websockets")]
 mod redis_impl {
-    use std::sync::Arc;
-    use log::error;
-    use tokio::sync::mpsc::Sender;
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use log::{error, info, warn};
+    use rocket::futures::StreamExt;
+    use tokio::{
+        sync::{mpsc::Sender, RwLock},
+        time::timeout,
+    };
     use rocket_ws::Message;
+    use redis::{AsyncCommands, Client, ConnectionManager, RedisResult};
+    use serde_json;
+    use uuid::Uuid;
+    use data_encoding::BASE64;
 
-    use crate::db::models::{UserId, AuthRequestId};
+    use crate::{db::models::{UserId, AuthRequestId}, CONFIG};
     use super::backends::{WebSocketBackend, AnonymousWebSocketBackend};
+
+    const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+    const USER_CONNECTIONS_PREFIX: &str = "vw:ws:users:";
+    const ANONYMOUS_CONNECTIONS_PREFIX: &str = "vw:ws:anon:";
+    const PUBSUB_CHANNEL_PREFIX: &str = "vw:ws:msg:";
+    const ANONYMOUS_PUBSUB_CHANNEL_PREFIX: &str = "vw:ws:anon:msg:";
+
+    type LocalConnections = Arc<RwLock<HashMap<Uuid, Sender<Message>>>>;
 
     #[derive(Clone)]
     pub struct RedisWebSocketBackend {
-        // TODO: Add Redis client and connection details
-        // redis_client: Arc<redis::Client>,
-        // redis_pool: Arc<redis::ConnectionManager>,
+        redis_manager: Arc<ConnectionManager>,
+        // Local storage for active WebSocket senders on this instance
+        local_connections: LocalConnections,
+        _pubsub_task: Arc<tokio::task::JoinHandle<()>>,
     }
 
     impl RedisWebSocketBackend {
-        pub fn new(/* redis_url: &str */) -> Self {
-            // TODO: Initialize Redis connection
-            Self {
-                // redis_client: Arc::new(redis::Client::open(redis_url).unwrap()),
+        pub async fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
+            let client = Client::open(redis_url)?;
+            let manager = ConnectionManager::new(client.clone()).await?;
+            let local_connections = Arc::new(RwLock::new(HashMap::new()));
+            
+            // Start pubsub listener task
+            let pubsub_connections = Arc::clone(&local_connections);
+            let pubsub_client = client.clone();
+            let pubsub_task = tokio::spawn(async move {
+                Self::pubsub_listener(pubsub_client, pubsub_connections).await;
+            });
+
+            info!("Redis WebSocket backend initialized");
+            
+            Ok(Self {
+                redis_manager: Arc::new(manager),
+                local_connections,
+                _pubsub_task: Arc::new(pubsub_task),
+            })
+        }
+
+        async fn pubsub_listener(client: Client, local_connections: LocalConnections) {
+            loop {
+                match client.get_async_connection().await {
+                    Ok(mut conn) => {
+                        let mut pubsub = conn.into_pubsub();
+                        
+                        // Subscribe to all user message channels
+                        if let Err(e) = pubsub.psubscribe(&format!("{}*", PUBSUB_CHANNEL_PREFIX)).await {
+                            error!("Failed to subscribe to Redis pub/sub: {}", e);
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+
+                        info!("Redis pub/sub listener started");
+
+                        loop {
+                            match pubsub.on_message().next().await {
+                                Some(msg) => {
+                                    if let Ok(channel) = msg.get_channel_name::<String>() {
+                                        if let Ok(payload) = msg.get_payload::<Vec<u8>>() {
+                                            Self::handle_pubsub_message(&channel, &payload, &local_connections).await;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    warn!("Redis pub/sub connection lost, reconnecting...");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to Redis for pub/sub: {}", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
             }
+        }
+
+        async fn handle_pubsub_message(channel: &str, payload: &[u8], local_connections: &LocalConnections) {
+            // Extract connection UUIDs for this user from the channel
+            if let Some(user_connections_str) = channel.strip_prefix(PUBSUB_CHANNEL_PREFIX) {
+                // Parse message metadata to get connection UUIDs
+                if let Ok(message_data) = serde_json::from_slice::<serde_json::Value>(payload) {
+                    if let Some(connection_uuids) = message_data.get("connection_uuids").and_then(|v| v.as_array()) {
+                        let connections = local_connections.read().await;
+                        
+                        for uuid_val in connection_uuids {
+                            if let Some(uuid_str) = uuid_val.as_str() {
+                                if let Ok(uuid) = Uuid::parse_str(uuid_str) {
+                                    if let Some(sender) = connections.get(&uuid) {
+                                        if let Some(data) = message_data.get("data").and_then(|v| v.as_str()) {
+                                            if let Ok(decoded_data) = BASE64.decode(data.as_bytes()) {
+                                                if let Err(e) = sender.send(Message::binary(&decoded_data)).await {
+                                                    error!("Error sending WS update via Redis: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        async fn get_user_connections(&self, user_id: &UserId) -> RedisResult<Vec<Uuid>> {
+            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
+            
+            let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
+            let connections: Vec<String> = conn.smembers(&key).await?;
+            
+            let mut uuids = Vec::new();
+            for conn_str in connections {
+                if let Ok(uuid) = Uuid::parse_str(&conn_str) {
+                    uuids.push(uuid);
+                }
+            }
+            Ok(uuids)
+        }
+
+        async fn add_user_connection(&self, user_id: &UserId, entry_uuid: Uuid) -> RedisResult<()> {
+            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
+            
+            let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
+            conn.sadd(&key, entry_uuid.to_string()).await?;
+            // Set expiration to clean up stale connections
+            conn.expire(&key, 3600).await?;
+            Ok(())
+        }
+
+        async fn remove_user_connection(&self, user_id: &UserId, entry_uuid: Uuid) -> RedisResult<()> {
+            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
+            
+            let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
+            conn.srem(&key, entry_uuid.to_string()).await?;
+            Ok(())
+        }
+
+        async fn publish_update(&self, user_id: &UserId, data: &[u8]) -> RedisResult<()> {
+            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
+            
+            // Get all connection UUIDs for this user from Redis
+            let connection_uuids = self.get_user_connections(user_id).await?;
+            
+            if !connection_uuids.is_empty() {
+                let channel = format!("{}{}", PUBSUB_CHANNEL_PREFIX, user_id);
+                let message = serde_json::json!({
+                    "connection_uuids": connection_uuids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+                    "data": BASE64.encode(data)
+                });
+                
+                conn.publish(&channel, message.to_string()).await?;
+            }
+            
+            Ok(())
         }
     }
 
     impl WebSocketBackend for RedisWebSocketBackend {
-        async fn add_connection(&self, _user_id: &UserId, _entry_uuid: uuid::Uuid, _sender: Sender<Message>) {
-            // TODO: Store connection info in Redis
-            todo!("Implement Redis WebSocket backend")
+        async fn add_connection(&self, user_id: &UserId, entry_uuid: uuid::Uuid, sender: Sender<Message>) {
+            // Store locally for this instance
+            {
+                let mut connections = self.local_connections.write().await;
+                connections.insert(entry_uuid, sender);
+            }
+            
+            // Register in Redis
+            if let Err(e) = self.add_user_connection(user_id, entry_uuid).await {
+                error!("Failed to register WebSocket connection in Redis: {}", e);
+                
+                // Fallback: remove from local connections if Redis fails
+                if CONFIG.redis_websocket_fallback_memory() {
+                    let mut connections = self.local_connections.write().await;
+                    connections.remove(&entry_uuid);
+                }
+            }
         }
         
-        async fn remove_connection(&self, _user_id: &UserId, _entry_uuid: uuid::Uuid) {
-            // TODO: Remove connection info from Redis
-            todo!("Implement Redis WebSocket backend")
+        async fn remove_connection(&self, user_id: &UserId, entry_uuid: uuid::Uuid) {
+            // Remove locally
+            {
+                let mut connections = self.local_connections.write().await;
+                connections.remove(&entry_uuid);
+            }
+            
+            // Remove from Redis
+            if let Err(e) = self.remove_user_connection(user_id, entry_uuid).await {
+                error!("Failed to remove WebSocket connection from Redis: {}", e);
+            }
         }
         
-        async fn send_update(&self, _user_id: &UserId, _data: &[u8]) {
-            // TODO: Send update via Redis pub/sub
-            todo!("Implement Redis WebSocket backend")
+        async fn send_update(&self, user_id: &UserId, data: &[u8]) {
+            // First try to send via Redis pub/sub
+            if let Err(e) = self.publish_update(user_id, data).await {
+                error!("Failed to publish WebSocket update to Redis: {}", e);
+                
+                // Fallback to local connections only if configured
+                if CONFIG.redis_websocket_fallback_memory() {
+                    warn!("Falling back to local WebSocket connections only");
+                    let connections = self.local_connections.read().await;
+                    for (_, sender) in connections.iter() {
+                        if let Err(e) = sender.send(Message::binary(data)).await {
+                            error!("Error sending local WS update: {}", e);
+                        }
+                    }
+                }
+            }
         }
     }
 
     #[derive(Clone)]
     pub struct RedisAnonymousWebSocketBackend {
-        // TODO: Add Redis client for anonymous connections
+        redis_manager: Arc<ConnectionManager>,
+        local_connections: Arc<RwLock<HashMap<String, Sender<Message>>>>,
+        _pubsub_task: Arc<tokio::task::JoinHandle<()>>,
     }
 
     impl RedisAnonymousWebSocketBackend {
-        pub fn new(/* redis_url: &str */) -> Self {
-            // TODO: Initialize Redis connection
-            Self {}
+        pub async fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
+            let client = Client::open(redis_url)?;
+            let manager = ConnectionManager::new(client.clone()).await?;
+            let local_connections = Arc::new(RwLock::new(HashMap::new()));
+            
+            // Start pubsub listener for anonymous connections
+            let pubsub_connections = Arc::clone(&local_connections);
+            let pubsub_client = client.clone();
+            let pubsub_task = tokio::spawn(async move {
+                Self::pubsub_listener(pubsub_client, pubsub_connections).await;
+            });
+
+            info!("Redis anonymous WebSocket backend initialized");
+            
+            Ok(Self {
+                redis_manager: Arc::new(manager),
+                local_connections,
+                _pubsub_task: Arc::new(pubsub_task),
+            })
+        }
+
+        async fn pubsub_listener(client: Client, local_connections: Arc<RwLock<HashMap<String, Sender<Message>>>>) {
+            loop {
+                match client.get_async_connection().await {
+                    Ok(mut conn) => {
+                        let mut pubsub = conn.into_pubsub();
+                        
+                        // Subscribe to anonymous message channels
+                        if let Err(e) = pubsub.psubscribe(&format!("{}*", ANONYMOUS_PUBSUB_CHANNEL_PREFIX)).await {
+                            error!("Failed to subscribe to anonymous Redis pub/sub: {}", e);
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+
+                        info!("Redis anonymous pub/sub listener started");
+
+                        loop {
+                            match pubsub.on_message().next().await {
+                                Some(msg) => {
+                                    if let Ok(channel) = msg.get_channel_name::<String>() {
+                                        if let Ok(payload) = msg.get_payload::<Vec<u8>>() {
+                                            Self::handle_anonymous_pubsub_message(&channel, &payload, &local_connections).await;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    warn!("Redis anonymous pub/sub connection lost, reconnecting...");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to Redis for anonymous pub/sub: {}", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+
+        async fn handle_anonymous_pubsub_message(channel: &str, payload: &[u8], local_connections: &Arc<RwLock<HashMap<String, Sender<Message>>>>) {
+            if let Some(token) = channel.strip_prefix(ANONYMOUS_PUBSUB_CHANNEL_PREFIX) {
+                if let Ok(message_data) = serde_json::from_slice::<serde_json::Value>(payload) {
+                    if let Some(data) = message_data.get("data").and_then(|v| v.as_str()) {
+                        if let Ok(decoded_data) = BASE64.decode(data.as_bytes()) {
+                            let connections = local_connections.read().await;
+                            if let Some(sender) = connections.get(token) {
+                                if let Err(e) = sender.send(Message::binary(&decoded_data)).await {
+                                    error!("Error sending anonymous WS update via Redis: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        async fn add_anonymous_connection(&self, token: &str) -> RedisResult<()> {
+            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
+            
+            let key = format!("{}{}", ANONYMOUS_CONNECTIONS_PREFIX, token);
+            conn.set_ex(&key, "active", 3600).await?; // 1 hour expiration
+            Ok(())
+        }
+
+        async fn remove_anonymous_connection(&self, token: &str) -> RedisResult<()> {
+            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
+            
+            let key = format!("{}{}", ANONYMOUS_CONNECTIONS_PREFIX, token);
+            conn.del(&key).await?;
+            Ok(())
+        }
+
+        async fn publish_anonymous_update(&self, token: &str, data: &[u8]) -> RedisResult<()> {
+            let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
+                .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
+            
+            let channel = format!("{}{}", ANONYMOUS_PUBSUB_CHANNEL_PREFIX, token);
+            let message = serde_json::json!({
+                "data": base64::encode(data)
+            });
+            
+            conn.publish(&channel, message.to_string()).await?;
+            Ok(())
         }
     }
 
     impl AnonymousWebSocketBackend for RedisAnonymousWebSocketBackend {
-        async fn add_connection(&self, _token: &str, _sender: Sender<Message>) {
-            // TODO: Store anonymous connection in Redis
-            todo!("Implement Redis anonymous WebSocket backend")
+        async fn add_connection(&self, token: &str, sender: Sender<Message>) {
+            // Store locally for this instance
+            {
+                let mut connections = self.local_connections.write().await;
+                connections.insert(token.to_string(), sender);
+            }
+            
+            // Register in Redis
+            if let Err(e) = self.add_anonymous_connection(token).await {
+                error!("Failed to register anonymous WebSocket connection in Redis: {}", e);
+                
+                // Fallback: remove from local connections if Redis fails
+                if CONFIG.redis_websocket_fallback_memory() {
+                    let mut connections = self.local_connections.write().await;
+                    connections.remove(token);
+                }
+            }
         }
         
-        async fn remove_connection(&self, _token: &str) {
-            // TODO: Remove anonymous connection from Redis
-            todo!("Implement Redis anonymous WebSocket backend")
+        async fn remove_connection(&self, token: &str) {
+            // Remove locally
+            {
+                let mut connections = self.local_connections.write().await;
+                connections.remove(token);
+            }
+            
+            // Remove from Redis
+            if let Err(e) = self.remove_anonymous_connection(token).await {
+                error!("Failed to remove anonymous WebSocket connection from Redis: {}", e);
+            }
         }
         
-        async fn send_update(&self, _token: &str, _data: &[u8]) {
-            // TODO: Send update to anonymous connection via Redis
-            todo!("Implement Redis anonymous WebSocket backend")
+        async fn send_update(&self, token: &str, data: &[u8]) {
+            // Try to send via Redis pub/sub
+            if let Err(e) = self.publish_anonymous_update(token, data).await {
+                error!("Failed to publish anonymous WebSocket update to Redis: {}", e);
+                
+                // Fallback to local connection only if configured
+                if CONFIG.redis_websocket_fallback_memory() {
+                    warn!("Falling back to local anonymous WebSocket connection only");
+                    let connections = self.local_connections.read().await;
+                    if let Some(sender) = connections.get(token) {
+                        if let Err(e) = sender.send(Message::binary(data)).await {
+                            error!("Error sending local anonymous WS update: {}", e);
+                        }
+                    }
+                }
+            }
         }
     }
 }

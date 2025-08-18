@@ -52,17 +52,29 @@ static NOTIFICATIONS_DISABLED: Lazy<bool> = Lazy::new(|| !CONFIG.enable_websocke
 
 /// Create the appropriate WebSocket backend based on configuration
 fn create_websocket_backend() -> Arc<dyn WebSocketBackend> {
-    // For now, always use memory backend
-    // TODO: Add Redis backend selection when CONFIG.redis_enabled() is implemented
-    /*
     #[cfg(feature = "redis-websockets")]
     {
-        if CONFIG.redis_enabled() {
+        if CONFIG._enable_redis_websockets() {
             info!("Using Redis WebSocket backend");
-            return Arc::new(RedisWebSocketBackend::new(&CONFIG.redis_url()));
+            
+            let redis_url = CONFIG.redis_websocket_url();
+            match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    crate::api::notifications::redis_backend::RedisWebSocketBackend::new(&redis_url).await
+                })
+            }) {
+                Ok(backend) => return Arc::new(backend),
+                Err(e) => {
+                    error!("Failed to initialize Redis WebSocket backend: {}", e);
+                    if CONFIG.redis_websocket_fallback_memory() {
+                        warn!("Falling back to in-memory WebSocket backend");
+                    } else {
+                        panic!("Redis WebSocket backend initialization failed and fallback is disabled");
+                    }
+                }
+            }
         }
     }
-    */
     
     info!("Using in-memory WebSocket backend");
     Arc::new(MemoryWebSocketBackend::new())
@@ -70,17 +82,29 @@ fn create_websocket_backend() -> Arc<dyn WebSocketBackend> {
 
 /// Create the appropriate anonymous WebSocket backend based on configuration
 fn create_anonymous_websocket_backend() -> Arc<dyn AnonymousWebSocketBackend> {
-    // For now, always use memory backend
-    // TODO: Add Redis backend selection when CONFIG.redis_enabled() is implemented
-    /*
     #[cfg(feature = "redis-websockets")]
     {
-        if CONFIG.redis_enabled() {
+        if CONFIG._enable_redis_websockets() {
             info!("Using Redis anonymous WebSocket backend");
-            return Arc::new(RedisAnonymousWebSocketBackend::new(&CONFIG.redis_url()));
+            
+            let redis_url = CONFIG.redis_websocket_url();
+            match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    crate::api::notifications::redis_backend::RedisAnonymousWebSocketBackend::new(&redis_url).await
+                })
+            }) {
+                Ok(backend) => return Arc::new(backend),
+                Err(e) => {
+                    error!("Failed to initialize Redis anonymous WebSocket backend: {}", e);
+                    if CONFIG.redis_websocket_fallback_memory() {
+                        warn!("Falling back to in-memory anonymous WebSocket backend");
+                    } else {
+                        panic!("Redis anonymous WebSocket backend initialization failed and fallback is disabled");
+                    }
+                }
+            }
         }
     }
-    */
     
     info!("Using in-memory anonymous WebSocket backend");
     Arc::new(MemoryAnonymousWebSocketBackend::new())

@@ -42,7 +42,7 @@ unstable = []
 # Redis-based stateless WebSockets for horizontal scaling
 # This feature enables Redis pub/sub for WebSocket notifications instead of in-memory storage
 # WARNING: This is experimental
-redis-websockets = ["dep:redis"]
+redis-websockets = ["dep:redis", "dep:tokio-util", "dep:serde_json", "dep:uuid"]
 
 [target."cfg(unix)".dependencies]
 # Logging

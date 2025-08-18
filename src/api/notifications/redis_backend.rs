@@ -351,7 +351,7 @@ mod redis_impl {
             
             let channel = format!("{}{}", ANONYMOUS_PUBSUB_CHANNEL_PREFIX, token);
             let message = serde_json::json!({
-                "data": base64::encode(data)
+                "data": BASE64.encode(data)
             });
             
             conn.publish(&channel, message.to_string()).await?;

@@ -6,7 +6,7 @@
  */
 
 use std::sync::Arc;
-use log::error;
+use log::{error, info};
 use tokio::sync::mpsc::Sender;
 use rocket_ws::Message;
 
@@ -49,6 +49,11 @@ impl WebSocketBackend for MemoryWebSocketBackend {
             }
         }
     }
+
+    fn shutdown(&self) {
+        // Memory backend doesn't need graceful shutdown - no background tasks to clean up
+        info!("Memory WebSocket backend shutdown called (no-op)");
+    }
 }
 
 #[derive(Clone)]
@@ -79,5 +84,10 @@ impl AnonymousWebSocketBackend for MemoryAnonymousWebSocketBackend {
                 error!("Error sending WS update {e}");
             }
         }
+    }
+
+    fn shutdown(&self) {
+        // Memory backend doesn't need graceful shutdown - no background tasks to clean up
+        info!("Memory anonymous WebSocket backend shutdown called (no-op)");
     }
 }

@@ -16,7 +16,7 @@ mod redis_impl {
     use log::{error, info, warn};
     use rocket::futures::StreamExt;
     use tokio::{
-        sync::{mpsc::Sender, RwLock},
+        sync::{mpsc::Sender, RwLock, broadcast},
         time::timeout,
     };
     use rocket_ws::Message;
@@ -74,6 +74,7 @@ mod redis_impl {
         health_check_interval: Duration,
         health_info: Arc<RwLock<RedisHealthInfo>>,
         _health_check_task: Arc<tokio::task::JoinHandle<()>>,
+        shutdown_tx: broadcast::Sender<()>,
     }
 
     impl RedisWebSocketBackend {
@@ -90,11 +91,15 @@ mod redis_impl {
             // Initialize health info
             let health_info = Arc::new(RwLock::new(RedisHealthInfo::default()));
             
+            // Create shutdown channel
+            let (shutdown_tx, shutdown_rx1) = broadcast::channel(1);
+            let shutdown_rx2 = shutdown_tx.subscribe();
+            
             // Start pubsub listener task
             let pubsub_connections = Arc::clone(&local_connections);
             let pubsub_client = client.clone();
             let pubsub_task = tokio::spawn(async move {
-                Self::pubsub_listener(pubsub_client, pubsub_connections).await;
+                Self::pubsub_listener(pubsub_client, pubsub_connections, shutdown_rx1).await;
             });
 
             // Start health check task
@@ -107,6 +112,7 @@ mod redis_impl {
                     health_check_info,
                     health_check_interval,
                     health_check_timeout,
+                    shutdown_rx2,
                 ).await;
             });
 
@@ -122,43 +128,60 @@ mod redis_impl {
                 health_check_interval,
                 health_info,
                 _health_check_task: Arc::new(health_check_task),
+                shutdown_tx,
             })
         }
 
-        async fn pubsub_listener(client: Client, local_connections: LocalConnections) {
+        async fn pubsub_listener(client: Client, local_connections: LocalConnections, mut shutdown_rx: broadcast::Receiver<()>) {
             loop {
-                match client.get_async_connection().await {
-                    Ok(mut conn) => {
-                        let mut pubsub = conn.into_pubsub();
-                        
-                        // Subscribe to all user message channels
-                        if let Err(e) = pubsub.psubscribe(&format!("{}*", PUBSUB_CHANNEL_PREFIX)).await {
-                            error!("Failed to subscribe to Redis pub/sub: {}", e);
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            continue;
-                        }
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        info!("Redis pub/sub listener received shutdown signal, exiting gracefully");
+                        break;
+                    }
+                    result = client.get_async_connection() => {
+                        match result {
+                            Ok(mut conn) => {
+                                let mut pubsub = conn.into_pubsub();
+                                
+                                // Subscribe to all user message channels
+                                if let Err(e) = pubsub.psubscribe(&format!("{}*", PUBSUB_CHANNEL_PREFIX)).await {
+                                    error!("Failed to subscribe to Redis pub/sub: {}", e);
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    continue;
+                                }
 
-                        info!("Redis pub/sub listener started");
+                                info!("Redis pub/sub listener started");
 
-                        loop {
-                            match pubsub.on_message().next().await {
-                                Some(msg) => {
-                                    if let Ok(channel) = msg.get_channel_name::<String>() {
-                                        if let Ok(payload) = msg.get_payload::<Vec<u8>>() {
-                                            Self::handle_pubsub_message(&channel, &payload, &local_connections).await;
+                                loop {
+                                    tokio::select! {
+                                        _ = shutdown_rx.recv() => {
+                                            info!("Redis pub/sub listener received shutdown signal, closing connection");
+                                            return;
+                                        }
+                                        msg = pubsub.on_message().next() => {
+                                            match msg {
+                                                Some(msg) => {
+                                                    if let Ok(channel) = msg.get_channel_name::<String>() {
+                                                        if let Ok(payload) = msg.get_payload::<Vec<u8>>() {
+                                                            Self::handle_pubsub_message(&channel, &payload, &local_connections).await;
+                                                        }
+                                                    }
+                                                }
+                                                None => {
+                                                    warn!("Redis pub/sub connection lost, reconnecting...");
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                                None => {
-                                    warn!("Redis pub/sub connection lost, reconnecting...");
-                                    break;
-                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to connect to Redis for pub/sub: {}", e);
+                                tokio::time::sleep(Duration::from_secs(5)).await;
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("Failed to connect to Redis for pub/sub: {}", e);
-                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
             }
@@ -198,34 +221,41 @@ mod redis_impl {
             health_info: Arc<RwLock<RedisHealthInfo>>,
             interval: Duration,
             timeout: Duration,
+            mut shutdown_rx: broadcast::Receiver<()>,
         ) {
             let mut timer = tokio::time::interval(interval);
             
             loop {
-                timer.tick().await;
-                
-                match Self::perform_health_check(&manager, timeout).await {
-                    Ok(()) => {
-                        let mut info = health_info.write().await;
-                        if info.status != RedisHealthStatus::Healthy {
-                            info!("Redis connection recovered after {} consecutive failures", info.consecutive_failures);
-                        }
-                        info.status = RedisHealthStatus::Healthy;
-                        info.last_check = Instant::now();
-                        info.consecutive_failures = 0;
-                        info.last_error = None;
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        info!("Redis health check loop received shutdown signal, exiting gracefully");
+                        break;
                     }
-                    Err(e) => {
-                        let mut info = health_info.write().await;
-                        info.status = RedisHealthStatus::Unhealthy;
-                        info.last_check = Instant::now();
-                        info.consecutive_failures += 1;
-                        info.last_error = Some(e.to_string());
-                        
-                        if info.consecutive_failures <= 3 {
-                            warn!("Redis health check failed (attempt {}): {}", info.consecutive_failures, e);
-                        } else {
-                            error!("Redis health check failed {} consecutive times: {}", info.consecutive_failures, e);
+                    _ = timer.tick() => {
+                        match Self::perform_health_check(&manager, timeout).await {
+                            Ok(()) => {
+                                let mut info = health_info.write().await;
+                                if info.status != RedisHealthStatus::Healthy {
+                                    info!("Redis connection recovered after {} consecutive failures", info.consecutive_failures);
+                                }
+                                info.status = RedisHealthStatus::Healthy;
+                                info.last_check = Instant::now();
+                                info.consecutive_failures = 0;
+                                info.last_error = None;
+                            }
+                            Err(e) => {
+                                let mut info = health_info.write().await;
+                                info.status = RedisHealthStatus::Unhealthy;
+                                info.last_check = Instant::now();
+                                info.consecutive_failures += 1;
+                                info.last_error = Some(e.to_string());
+                                
+                                if info.consecutive_failures <= 3 {
+                                    warn!("Redis health check failed (attempt {}): {}", info.consecutive_failures, e);
+                                } else {
+                                    error!("Redis health check failed {} consecutive times: {}", info.consecutive_failures, e);
+                                }
+                            }
                         }
                     }
                 }
@@ -258,6 +288,14 @@ mod redis_impl {
         /// Check if Redis is currently healthy
         pub async fn is_healthy(&self) -> bool {
             self.health_info.read().await.status == RedisHealthStatus::Healthy
+        }
+
+        /// Shutdown the Redis WebSocket backend gracefully
+        pub fn shutdown(&self) {
+            info!("Shutting down Redis WebSocket backend");
+            if let Err(e) = self.shutdown_tx.send(()) {
+                warn!("Failed to send shutdown signal to Redis WebSocket backend tasks: {}", e);
+            }
         }
 
         async fn get_user_connections(&self, user_id: &UserId) -> RedisResult<Vec<Uuid>> {
@@ -420,6 +458,7 @@ mod redis_impl {
         health_check_interval: Duration,
         health_info: Arc<RwLock<RedisHealthInfo>>,
         _health_check_task: Arc<tokio::task::JoinHandle<()>>,
+        shutdown_tx: broadcast::Sender<()>,
     }
 
     impl RedisAnonymousWebSocketBackend {
@@ -436,11 +475,15 @@ mod redis_impl {
             // Initialize health info
             let health_info = Arc::new(RwLock::new(RedisHealthInfo::default()));
             
+            // Create shutdown channel
+            let (shutdown_tx, shutdown_rx1) = broadcast::channel(1);
+            let shutdown_rx2 = shutdown_tx.subscribe();
+            
             // Start pubsub listener for anonymous connections
             let pubsub_connections = Arc::clone(&local_connections);
             let pubsub_client = client.clone();
             let pubsub_task = tokio::spawn(async move {
-                Self::pubsub_listener(pubsub_client, pubsub_connections).await;
+                Self::pubsub_listener(pubsub_client, pubsub_connections, shutdown_rx1).await;
             });
 
             // Start health check task (shared with main backend)
@@ -453,6 +496,7 @@ mod redis_impl {
                     health_check_info,
                     health_check_interval,
                     health_check_timeout,
+                    shutdown_rx2,
                 ).await;
             });
 
@@ -468,43 +512,60 @@ mod redis_impl {
                 health_check_interval,
                 health_info,
                 _health_check_task: Arc::new(health_check_task),
+                shutdown_tx,
             })
         }
 
-        async fn pubsub_listener(client: Client, local_connections: Arc<RwLock<HashMap<String, Sender<Message>>>>) {
+        async fn pubsub_listener(client: Client, local_connections: Arc<RwLock<HashMap<String, Sender<Message>>>>, mut shutdown_rx: broadcast::Receiver<()>) {
             loop {
-                match client.get_async_connection().await {
-                    Ok(mut conn) => {
-                        let mut pubsub = conn.into_pubsub();
-                        
-                        // Subscribe to anonymous message channels
-                        if let Err(e) = pubsub.psubscribe(&format!("{}*", ANONYMOUS_PUBSUB_CHANNEL_PREFIX)).await {
-                            error!("Failed to subscribe to anonymous Redis pub/sub: {}", e);
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            continue;
-                        }
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        info!("Redis anonymous pub/sub listener received shutdown signal, exiting gracefully");
+                        break;
+                    }
+                    result = client.get_async_connection() => {
+                        match result {
+                            Ok(mut conn) => {
+                                let mut pubsub = conn.into_pubsub();
+                                
+                                // Subscribe to anonymous message channels
+                                if let Err(e) = pubsub.psubscribe(&format!("{}*", ANONYMOUS_PUBSUB_CHANNEL_PREFIX)).await {
+                                    error!("Failed to subscribe to anonymous Redis pub/sub: {}", e);
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    continue;
+                                }
 
-                        info!("Redis anonymous pub/sub listener started");
+                                info!("Redis anonymous pub/sub listener started");
 
-                        loop {
-                            match pubsub.on_message().next().await {
-                                Some(msg) => {
-                                    if let Ok(channel) = msg.get_channel_name::<String>() {
-                                        if let Ok(payload) = msg.get_payload::<Vec<u8>>() {
-                                            Self::handle_anonymous_pubsub_message(&channel, &payload, &local_connections).await;
+                                loop {
+                                    tokio::select! {
+                                        _ = shutdown_rx.recv() => {
+                                            info!("Redis anonymous pub/sub listener received shutdown signal, closing connection");
+                                            return;
+                                        }
+                                        msg = pubsub.on_message().next() => {
+                                            match msg {
+                                                Some(msg) => {
+                                                    if let Ok(channel) = msg.get_channel_name::<String>() {
+                                                        if let Ok(payload) = msg.get_payload::<Vec<u8>>() {
+                                                            Self::handle_anonymous_pubsub_message(&channel, &payload, &local_connections).await;
+                                                        }
+                                                    }
+                                                }
+                                                None => {
+                                                    warn!("Redis anonymous pub/sub connection lost, reconnecting...");
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                                None => {
-                                    warn!("Redis anonymous pub/sub connection lost, reconnecting...");
-                                    break;
-                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to connect to Redis for anonymous pub/sub: {}", e);
+                                tokio::time::sleep(Duration::from_secs(5)).await;
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("Failed to connect to Redis for anonymous pub/sub: {}", e);
-                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
             }
@@ -566,6 +627,14 @@ mod redis_impl {
         /// Check if Redis is currently healthy
         pub async fn is_healthy(&self) -> bool {
             self.health_info.read().await.status == RedisHealthStatus::Healthy
+        }
+
+        /// Shutdown the Redis anonymous WebSocket backend gracefully
+        pub fn shutdown(&self) {
+            info!("Shutting down Redis anonymous WebSocket backend");
+            if let Err(e) = self.shutdown_tx.send(()) {
+                warn!("Failed to send shutdown signal to Redis anonymous WebSocket backend tasks: {}", e);
+            }
         }
     }
 

@@ -141,6 +141,13 @@ pub fn routes() -> Vec<Route> {
     }
 }
 
+/// Shutdown WebSocket backends gracefully
+pub fn shutdown_websocket_backends() {
+    info!("Shutting down WebSocket backends");
+    WS_BACKEND.shutdown();
+    WS_ANONYMOUS_BACKEND.shutdown();
+}
+
 #[derive(FromForm, Debug)]
 struct WsAccessToken {
     access_token: Option<String>,

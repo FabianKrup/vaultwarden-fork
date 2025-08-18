@@ -608,6 +608,10 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.expect("Error setting Ctrl-C handler");
         info!("Exiting Vaultwarden!");
+        
+        // Shutdown WebSocket backends gracefully
+        crate::api::shutdown_websocket_backends();
+        
         CONFIG.shutdown();
     });
 

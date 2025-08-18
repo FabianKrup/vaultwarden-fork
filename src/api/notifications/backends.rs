@@ -24,6 +24,10 @@ pub trait WebSocketBackend: Send + Sync {
     
     /// Send an update to all connections for a specific user
     fn send_update(&self, user_id: &UserId, data: &[u8]) -> impl std::future::Future<Output = ()> + Send;
+    
+    /// Shutdown the backend gracefully
+    /// This should clean up any background tasks, close connections, etc.
+    fn shutdown(&self);
 }
 
 /// Trait for anonymous WebSocket backend implementations
@@ -39,4 +43,8 @@ pub trait AnonymousWebSocketBackend: Send + Sync {
     
     /// Send an update to a specific anonymous connection
     fn send_update(&self, token: &str, data: &[u8]) -> impl std::future::Future<Output = ()> + Send;
+    
+    /// Shutdown the backend gracefully
+    /// This should clean up any background tasks, close connections, etc.
+    fn shutdown(&self);
 }

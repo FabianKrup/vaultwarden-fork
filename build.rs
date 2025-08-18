@@ -13,6 +13,8 @@ fn main() {
     println!("cargo:rustc-cfg=query_logger");
     #[cfg(feature = "s3")]
     println!("cargo:rustc-cfg=s3");
+    #[cfg(feature = "redis-websockets")]
+    println!("cargo:rustc-cfg=redis_websockets");
 
     #[cfg(not(any(feature = "sqlite", feature = "mysql", feature = "postgresql")))]
     compile_error!(
@@ -26,6 +28,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(postgresql)");
     println!("cargo::rustc-check-cfg=cfg(query_logger)");
     println!("cargo::rustc-check-cfg=cfg(s3)");
+    println!("cargo::rustc-check-cfg=cfg(redis_websockets)");
 
     // Rerun when these paths are changed.
     // Someone could have checked-out a tag or specific commit, but no other files changed.
@@ -36,6 +39,9 @@ fn main() {
 
     #[cfg(all(not(debug_assertions), feature = "query_logger"))]
     compile_error!("Query Logging is only allowed during development, it is not intended for production usage!");
+
+    #[cfg(all(not(debug_assertions), feature = "redis-websockets"))]
+    compile_error!("Redis WebSockets is experimental and should be used with caution.");
 
     // Support $BWRS_VERSION for legacy compatibility, but default to $VW_VERSION.
     // If neither exist, read from git.

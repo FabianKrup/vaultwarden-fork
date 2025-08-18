@@ -432,6 +432,8 @@ make_config! {
         redis_websocket_pool_size:      u32,    false,  def,    10;
         /// Redis operation timeout in seconds
         redis_websocket_timeout:        u64,    false,  def,    5;
+        /// Redis health check interval in seconds
+        redis_websocket_health_check_interval: u64, false, def, 30;
         /// Fallback to memory backend on Redis failure
         redis_websocket_fallback_memory: bool,  false,  def,    true;
     },

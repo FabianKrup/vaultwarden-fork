@@ -20,7 +20,7 @@ mod redis_impl {
         time::timeout,
     };
     use rocket_ws::Message;
-    use redis::{AsyncCommands, Client, ConnectionManager, RedisResult};
+    use redis::{AsyncCommands, Client, ConnectionManager, RedisResult, Script};
     use serde_json;
     use uuid::Uuid;
     use data_encoding::BASE64;
@@ -154,9 +154,16 @@ mod redis_impl {
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
             let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
-            conn.sadd(&key, entry_uuid.to_string()).await?;
-            // Set expiration to clean up stale connections
-            conn.expire(&key, 3600).await?;
+            
+            // Use MULTI/EXEC transaction to atomically add connection and set expiration
+            // This prevents race conditions where the key could be deleted between SADD and EXPIRE
+            redis::pipe()
+                .atomic()
+                .sadd(&key, entry_uuid.to_string())
+                .expire(&key, 3600)
+                .query_async(&mut conn)
+                .await?;
+            
             Ok(())
         }
 
@@ -173,17 +180,39 @@ mod redis_impl {
             let mut conn = timeout(REDIS_TIMEOUT, self.redis_manager.clone().get_async_connection()).await
                 .map_err(|_| redis::RedisError::from((redis::ErrorKind::IoError, "Redis timeout")))??;
             
-            // Get all connection UUIDs for this user from Redis
-            let connection_uuids = self.get_user_connections(user_id).await?;
+            let key = format!("{}{}", USER_CONNECTIONS_PREFIX, user_id);
+            let channel = format!("{}{}", PUBSUB_CHANNEL_PREFIX, user_id);
+            let encoded_data = BASE64.encode(data);
             
-            if !connection_uuids.is_empty() {
-                let channel = format!("{}{}", PUBSUB_CHANNEL_PREFIX, user_id);
-                let message = serde_json::json!({
-                    "connection_uuids": connection_uuids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
-                    "data": BASE64.encode(data)
-                });
+            // Use Lua script to atomically get connection UUIDs and publish message
+            // This completely eliminates race conditions between getting UUIDs and publishing
+            let lua_script = r#"
+                local key = KEYS[1]
+                local channel = KEYS[2] 
+                local encoded_data = ARGV[1]
                 
-                conn.publish(&channel, message.to_string()).await?;
+                local uuids = redis.call('SMEMBERS', key)
+                if #uuids > 0 then
+                    local message_data = {
+                        connection_uuids = uuids,
+                        data = encoded_data
+                    }
+                    local message_json = cjson.encode(message_data)
+                    redis.call('PUBLISH', channel, message_json)
+                    return #uuids
+                end
+                return 0
+            "#;
+            
+            let published_count: i32 = Script::new(lua_script)
+                .key(&key)
+                .key(&channel)
+                .arg(&encoded_data)
+                .invoke_async(&mut conn)
+                .await?;
+            
+            if published_count > 0 {
+                info!("Published WebSocket update to {} connections for user {}", published_count, user_id);
             }
             
             Ok(())

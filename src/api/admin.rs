@@ -719,6 +719,10 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) 
         "ip_header_config": &CONFIG.ip_header(),
         "uses_proxy": uses_proxy,
         "enable_websocket": &CONFIG.enable_websocket(),
+        #[cfg(redis_websockets)]
+        "redis_websocket_enabled": &CONFIG._enable_redis_websockets(),
+        #[cfg(not(redis_websockets))]
+        "redis_websocket_enabled": false,
         "db_type": *DB_TYPE,
         "db_version": get_sql_server_version(&mut conn).await,
         "admin_url": format!("{}/diagnostics", admin_url()),

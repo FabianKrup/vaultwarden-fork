@@ -1,8 +1,27 @@
+/*!
+ * WebSocket Notifications Backend System
+ * 
+ * This module provides a pluggable backend system for WebSocket notifications.
+ * Currently supports:
+ * - In-memory backend (default): Uses DashMap for local storage
+ * - Redis backend (planned): Will use Redis pub/sub for distributed WebSocket support
+ * 
+ * The backend system allows for easy swapping between different storage mechanisms
+ * without changing the application logic.
+ */
+
+mod backends;
+mod memory_backend;
+#[cfg(feature = "redis-websockets")]
+mod redis_backend;
+
 use std::{net::IpAddr, sync::Arc, time::Duration};
 
 use chrono::{NaiveDateTime, Utc};
+use log::{error, info};
 use rmpv::Value;
-use rocket::{futures::StreamExt, Route};
+use rocket::{futures::StreamExt, get, routes, Route, FromForm};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 
 use rocket_ws::{Message, WebSocket};
@@ -18,17 +37,11 @@ use crate::{
 
 use once_cell::sync::Lazy;
 
-pub static WS_USERS: Lazy<Arc<WebSocketUsers>> = Lazy::new(|| {
-    Arc::new(WebSocketUsers {
-        map: Arc::new(dashmap::DashMap::new()),
-    })
-});
+pub use backends::{WebSocketBackend, AnonymousWebSocketBackend};
+pub use memory_backend::{MemoryWebSocketBackend, MemoryAnonymousWebSocketBackend};
 
-pub static WS_ANONYMOUS_SUBSCRIPTIONS: Lazy<Arc<AnonymousWebSocketSubscriptions>> = Lazy::new(|| {
-    Arc::new(AnonymousWebSocketSubscriptions {
-        map: Arc::new(dashmap::DashMap::new()),
-    })
-});
+#[cfg(feature = "redis-websockets")]
+pub use redis_backend::{RedisWebSocketBackend, RedisAnonymousWebSocketBackend};
 
 use super::{
     push::push_auth_request, push::push_auth_response, push_cipher_update, push_folder_update, push_logout,
@@ -36,6 +49,64 @@ use super::{
 };
 
 static NOTIFICATIONS_DISABLED: Lazy<bool> = Lazy::new(|| !CONFIG.enable_websocket() && !CONFIG.push_enabled());
+
+/// Create the appropriate WebSocket backend based on configuration
+fn create_websocket_backend() -> Arc<dyn WebSocketBackend> {
+    // For now, always use memory backend
+    // TODO: Add Redis backend selection when CONFIG.redis_enabled() is implemented
+    /*
+    #[cfg(feature = "redis-websockets")]
+    {
+        if CONFIG.redis_enabled() {
+            info!("Using Redis WebSocket backend");
+            return Arc::new(RedisWebSocketBackend::new(&CONFIG.redis_url()));
+        }
+    }
+    */
+    
+    info!("Using in-memory WebSocket backend");
+    Arc::new(MemoryWebSocketBackend::new())
+}
+
+/// Create the appropriate anonymous WebSocket backend based on configuration
+fn create_anonymous_websocket_backend() -> Arc<dyn AnonymousWebSocketBackend> {
+    // For now, always use memory backend
+    // TODO: Add Redis backend selection when CONFIG.redis_enabled() is implemented
+    /*
+    #[cfg(feature = "redis-websockets")]
+    {
+        if CONFIG.redis_enabled() {
+            info!("Using Redis anonymous WebSocket backend");
+            return Arc::new(RedisAnonymousWebSocketBackend::new(&CONFIG.redis_url()));
+        }
+    }
+    */
+    
+    info!("Using in-memory anonymous WebSocket backend");
+    Arc::new(MemoryAnonymousWebSocketBackend::new())
+}
+
+// Global backend instances
+pub static WS_BACKEND: Lazy<Arc<dyn WebSocketBackend>> = Lazy::new(|| {
+    create_websocket_backend()
+});
+
+pub static WS_ANONYMOUS_BACKEND: Lazy<Arc<dyn AnonymousWebSocketBackend>> = Lazy::new(|| {
+    create_anonymous_websocket_backend()
+});
+
+// Legacy aliases for backward compatibility
+pub static WS_USERS: Lazy<Arc<WebSocketUsers>> = Lazy::new(|| {
+    Arc::new(WebSocketUsers {
+        backend: Arc::clone(&WS_BACKEND),
+    })
+});
+
+pub static WS_ANONYMOUS_SUBSCRIPTIONS: Lazy<Arc<AnonymousWebSocketSubscriptions>> = Lazy::new(|| {
+    Arc::new(AnonymousWebSocketSubscriptions {
+        backend: Arc::clone(&WS_ANONYMOUS_BACKEND),
+    })
+});
 
 pub fn routes() -> Vec<Route> {
     if CONFIG.enable_websocket() {
@@ -52,16 +123,16 @@ struct WsAccessToken {
 }
 
 struct WSEntryMapGuard {
-    users: Arc<WebSocketUsers>,
+    backend: Arc<dyn WebSocketBackend>,
     user_uuid: UserId,
     entry_uuid: uuid::Uuid,
     addr: IpAddr,
 }
 
 impl WSEntryMapGuard {
-    fn new(users: Arc<WebSocketUsers>, user_uuid: UserId, entry_uuid: uuid::Uuid, addr: IpAddr) -> Self {
+    fn new(backend: Arc<dyn WebSocketBackend>, user_uuid: UserId, entry_uuid: uuid::Uuid, addr: IpAddr) -> Self {
         Self {
-            users,
+            backend,
             user_uuid,
             entry_uuid,
             addr,
@@ -72,22 +143,27 @@ impl WSEntryMapGuard {
 impl Drop for WSEntryMapGuard {
     fn drop(&mut self) {
         info!("Closing WS connection from {}", self.addr);
-        if let Some(mut entry) = self.users.map.get_mut(self.user_uuid.as_ref()) {
-            entry.retain(|(uuid, _)| uuid != &self.entry_uuid);
-        }
+        tokio::spawn({
+            let backend = Arc::clone(&self.backend);
+            let user_uuid = self.user_uuid.clone();
+            let entry_uuid = self.entry_uuid;
+            async move {
+                backend.remove_connection(&user_uuid, entry_uuid).await;
+            }
+        });
     }
 }
 
 struct WSAnonymousEntryMapGuard {
-    subscriptions: Arc<AnonymousWebSocketSubscriptions>,
+    backend: Arc<dyn AnonymousWebSocketBackend>,
     token: String,
     addr: IpAddr,
 }
 
 impl WSAnonymousEntryMapGuard {
-    fn new(subscriptions: Arc<AnonymousWebSocketSubscriptions>, token: String, addr: IpAddr) -> Self {
+    fn new(backend: Arc<dyn AnonymousWebSocketBackend>, token: String, addr: IpAddr) -> Self {
         Self {
-            subscriptions,
+            backend,
             token,
             addr,
         }
@@ -97,7 +173,13 @@ impl WSAnonymousEntryMapGuard {
 impl Drop for WSAnonymousEntryMapGuard {
     fn drop(&mut self) {
         info!("Closing WS connection from {}", self.addr);
-        self.subscriptions.map.remove(&self.token);
+        tokio::spawn({
+            let backend = Arc::clone(&self.backend);
+            let token = self.token.clone();
+            async move {
+                backend.remove_connection(&token).await;
+            }
+        });
     }
 }
 
@@ -125,15 +207,21 @@ fn websockets_hub<'r>(
     };
 
     let (mut rx, guard) = {
-        let users = Arc::clone(&WS_USERS);
-
+        let backend = Arc::clone(&WS_BACKEND);
+        
         // Add a channel to send messages to this client to the map
         let entry_uuid = uuid::Uuid::new_v4();
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
-        users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, tx));
+        
+        // Add the connection via the backend
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                backend.add_connection(&claims.sub, entry_uuid, tx).await;
+            })
+        });
 
         // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
-        (rx, WSEntryMapGuard::new(users, claims.sub, entry_uuid, addr))
+        (rx, WSEntryMapGuard::new(backend, claims.sub, entry_uuid, addr))
     };
 
     Ok({
@@ -193,14 +281,20 @@ fn anonymous_websockets_hub<'r>(ws: WebSocket, token: String, ip: ClientIp) -> R
     info!("Accepting Anonymous Rocket WS connection from {addr}");
 
     let (mut rx, guard) = {
-        let subscriptions = Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS);
+        let backend = Arc::clone(&WS_ANONYMOUS_BACKEND);
 
         // Add a channel to send messages to this client to the map
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
-        subscriptions.map.insert(token.clone(), tx);
+        
+        // Add the connection via the backend
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                backend.add_connection(&token, tx).await;
+            })
+        });
 
         // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
-        (rx, WSAnonymousEntryMapGuard::new(subscriptions, token, addr))
+        (rx, WSAnonymousEntryMapGuard::new(backend, token, addr))
     };
 
     Ok({
@@ -320,24 +414,12 @@ static INITIAL_MESSAGE: InitialMessage<'static> = InitialMessage {
     version: 1,
 };
 
-// We attach the UUID to the sender so we can differentiate them when we need to remove them from the Vec
-type UserSenders = (uuid::Uuid, Sender<Message>);
 #[derive(Clone)]
 pub struct WebSocketUsers {
-    map: Arc<dashmap::DashMap<String, Vec<UserSenders>>>,
+    backend: Arc<dyn WebSocketBackend>,
 }
 
 impl WebSocketUsers {
-    async fn send_update(&self, user_id: &UserId, data: &[u8]) {
-        if let Some(user) = self.map.get(user_id.as_ref()).map(|v| v.clone()) {
-            for (_, sender) in user.iter() {
-                if let Err(e) = sender.send(Message::binary(data)).await {
-                    error!("Error sending WS update {e}");
-                }
-            }
-        }
-    }
-
     // NOTE: The last modified date needs to be updated before calling these methods
     pub async fn send_user_update(&self, ut: UpdateType, user: &User, push_uuid: &Option<PushId>, conn: &mut DbConn) {
         // Skip any processing if both WebSockets and Push are not active
@@ -351,7 +433,7 @@ impl WebSocketUsers {
         );
 
         if CONFIG.enable_websocket() {
-            self.send_update(&user.uuid, &data).await;
+            self.backend.send_update(&user.uuid, &data).await;
         }
 
         if CONFIG.push_enabled() {
@@ -371,7 +453,7 @@ impl WebSocketUsers {
         );
 
         if CONFIG.enable_websocket() {
-            self.send_update(&user.uuid, &data).await;
+            self.backend.send_update(&user.uuid, &data).await;
         }
 
         if CONFIG.push_enabled() {
@@ -395,7 +477,7 @@ impl WebSocketUsers {
         );
 
         if CONFIG.enable_websocket() {
-            self.send_update(&folder.user_uuid, &data).await;
+            self.backend.send_update(&folder.user_uuid, &data).await;
         }
 
         if CONFIG.push_enabled() {
@@ -443,7 +525,7 @@ impl WebSocketUsers {
 
         if CONFIG.enable_websocket() {
             for uuid in user_ids {
-                self.send_update(uuid, &data).await;
+                self.backend.send_update(uuid, &data).await;
             }
         }
 
@@ -478,7 +560,7 @@ impl WebSocketUsers {
 
         if CONFIG.enable_websocket() {
             for uuid in user_ids {
-                self.send_update(uuid, &data).await;
+                self.backend.send_update(uuid, &data).await;
             }
         }
         if CONFIG.push_enabled() && user_ids.len() == 1 {
@@ -503,7 +585,7 @@ impl WebSocketUsers {
             Some(device.uuid.clone()),
         );
         if CONFIG.enable_websocket() {
-            self.send_update(user_id, &data).await;
+            self.backend.send_update(user_id, &data).await;
         }
 
         if CONFIG.push_enabled() {
@@ -528,7 +610,7 @@ impl WebSocketUsers {
             Some(device.uuid.clone()),
         );
         if CONFIG.enable_websocket() {
-            self.send_update(user_id, &data).await;
+            self.backend.send_update(user_id, &data).await;
         }
 
         if CONFIG.push_enabled() {
@@ -539,18 +621,10 @@ impl WebSocketUsers {
 
 #[derive(Clone)]
 pub struct AnonymousWebSocketSubscriptions {
-    map: Arc<dashmap::DashMap<String, Sender<Message>>>,
+    backend: Arc<dyn AnonymousWebSocketBackend>,
 }
 
 impl AnonymousWebSocketSubscriptions {
-    async fn send_update(&self, token: &str, data: &[u8]) {
-        if let Some(sender) = self.map.get(token).map(|v| v.clone()) {
-            if let Err(e) = sender.send(Message::binary(data)).await {
-                error!("Error sending WS update {e}");
-            }
-        }
-    }
-
     pub async fn send_auth_response(&self, user_id: &UserId, auth_request_id: &AuthRequestId) {
         if !CONFIG.enable_websocket() {
             return;
@@ -560,7 +634,7 @@ impl AnonymousWebSocketSubscriptions {
             UpdateType::AuthRequestResponse,
             user_id.clone(),
         );
-        self.send_update(auth_request_id, &data).await;
+        self.backend.send_update(auth_request_id, &data).await;
     }
 }
 

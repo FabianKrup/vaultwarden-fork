@@ -1,7 +1,6 @@
 use std::sync::LazyLock;
 
 pub(crate) fn join_path(base: &str, child: &str) -> String {
-    #[cfg(s3)]
     if s3::is_uri(base) {
         return s3::join_path(base, child);
     }
@@ -20,7 +19,6 @@ pub(crate) fn join_path(base: &str, child: &str) -> String {
 pub(crate) fn with_extension(path: &str, extension: &str) -> String {
     let extension = extension.trim_start_matches('.');
 
-    #[cfg(s3)]
     if s3::is_uri(path) {
         return s3::with_extension(path, extension);
     }
@@ -29,7 +27,6 @@ pub(crate) fn with_extension(path: &str, extension: &str) -> String {
 }
 
 pub(crate) fn parent(path: &str) -> Option<String> {
-    #[cfg(s3)]
     if s3::is_uri(path) {
         return s3::parent(path);
     }
@@ -38,7 +35,6 @@ pub(crate) fn parent(path: &str) -> Option<String> {
 }
 
 pub(crate) fn file_name(path: &str) -> Option<String> {
-    #[cfg(s3)]
     if s3::is_uri(path) {
         return s3::file_name(path);
     }
@@ -60,10 +56,6 @@ pub(crate) fn operator_for_path(path: &str) -> Result<opendal::Operator, crate::
     }
 
     let operator = if path.starts_with("s3://") {
-        #[cfg(not(s3))]
-        return Err(opendal::Error::new(opendal::ErrorKind::ConfigInvalid, "S3 support is not enabled").into());
-
-        #[cfg(s3)]
         s3::operator_for_path(path)?
     } else {
         let builder = opendal::services::Fs::default().root(path);
@@ -75,7 +67,6 @@ pub(crate) fn operator_for_path(path: &str) -> Result<opendal::Operator, crate::
     Ok(operator)
 }
 
-#[cfg(s3)]
 mod s3 {
     use reqwest::Url;
 
@@ -267,7 +258,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, s3))]
+#[cfg(test)]
 mod s3_tests {
     use super::*;
 

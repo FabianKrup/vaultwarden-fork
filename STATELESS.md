@@ -21,7 +21,7 @@ A replica holds **no authoritative state** on its local filesystem or in process
 |------|----------|-----------|
 | Deployment target | **Multi-replica HA** | Full horizontal scaling behind a load balancer. |
 | Durable record store | **External SQL** (PostgreSQL / MySQL) | Already supported via `DATABASE_URL`. SQLite file is disallowed in stateless mode. |
-| Blob storage (attachments, sends, icons, key, config) | **S3 / S3-compatible object storage** | Routed through the opendal `PathType` abstraction. The FS abstraction is stable; the **S3 backend is new and opt-in** (`s3` feature, opendal pre-1.0) — see §3.1 caveat and roadmap step 0. |
+| Blob storage (attachments, sends, icons, key, config) | **S3 / S3-compatible object storage** | Routed through the opendal `PathType` abstraction. This fork **compiles the S3 backend by default** (no `s3` feature flag); opendal is still pre-1.0, so see the §3.1 maturity caveat and roadmap step 0. |
 | Live-sync (WebSocket fan-out) | **Redis pub/sub backplane** | Any replica can broadcast to clients connected to any other replica. |
 | Scheduled background jobs | **DB distributed lock (leader election)** | Only one replica runs the scheduler at a time. No extra infra beyond the DB. |
 | JWT / RSA signing key | **Injected via env / secret manager** | Deterministic, identical across all replicas, no per-instance generation. |
@@ -47,7 +47,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | Session / refresh / 2FA-remember tokens | DB rows | ✅ | **Stable** | `src/db/models/device.rs:34` |
 | JWT validation | Stateless signature check | ✅ | **Stable** | `src/auth.rs:106` |
 
-> **S3 backend maturity caveat.** S3 is **not** part of a default build — it requires compiling with the `s3` feature (`build.rs:16`, `Cargo.toml:43`). The opendal dependency is `0.56.0` (`Cargo.toml:257`) — **pre-1.0, so its API is not frozen**. Full S3 parameter support (`OpenDAL S3 parameter support`, #6127) landed only **2026-05-15**, ~2 weeks before this assessment. It carries **no "experimental" label** in the code or `.env.template`, but it is new and comparatively unproven. The fork's reliance on S3 for attachments/sends/icons should be **validated end-to-end** (upload, download, delete, recursive Send purge) against the target object store before production. Treat opendal version bumps as potentially breaking.
+> **S3 backend maturity caveat.** This fork **always compiles S3 in** (the upstream `s3` feature flag and its `cfg(s3)` gates were removed; opendal builds with `services-s3` and the AWS credential crates are mandatory deps). The opendal dependency is `0.56.0` — **pre-1.0, so its API is not frozen**. Full S3 parameter support (`OpenDAL S3 parameter support`, #6127) landed only **2026-05-15**, ~2 weeks before this assessment. It carries **no "experimental" label** in the code or `.env.template`, but it is new and comparatively unproven. The fork's reliance on S3 for attachments/sends/icons should be **validated end-to-end** (upload, download, delete, recursive Send purge) against the target object store before production. Treat opendal version bumps as potentially breaking.
 
 ### 3.2 Stateless blockers (work required)
 
@@ -87,7 +87,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 ### Target external dependencies
 
 - **SQL database**: PostgreSQL (recommended) or MySQL.
-- **S3-compatible object storage**: AWS S3, MinIO, etc. (build with the `s3` feature/cfg).
+- **S3-compatible object storage**: AWS S3, MinIO, etc. (compiled in by default — no feature flag).
 - **Redis**: pub/sub backplane (WebSocket fan-out) + shared rate-limit store.
 
 ### Required configuration (target)
@@ -107,7 +107,7 @@ REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 
 ## 5. Roadmap
 
-0. **Validate the S3 backend** (§3.1 caveat) — compile with `s3`, exercise upload/download/delete/recursive-purge for attachments + sends + icons against the target object store. Pin the opendal version. Prerequisite for trusting blob storage.
+0. **Validate the S3 backend** (§3.1 caveat) — S3 is now compiled in by default (no `s3` feature); exercise upload/download/delete/recursive-purge for attachments + sends + icons against the target object store. Pin the opendal version. Prerequisite for trusting blob storage.
 1. ✅ **JWT key injection** (#6) — **done.** `PRIVATE_RSA_KEY_PEM` env var, read directly in `initialize_keys` (`src/auth.rs:63`), takes precedence over `RSA_KEY_FILENAME` and disables on-boot generation. Read straight from the env (not `CONFIG`) so the key never reaches the admin panel, `config.json`, or logs. Unblocks deterministic multi-replica boot.
 2. ✅ **Redis backplane for WebSocket fan-out** (#1, #2) — **done.** `REDIS_URL` enables a Redis pub/sub backplane (`src/api/notifications.rs`): each replica keeps its `DashMap` as a local registry, publishes updates to `<prefix>:ws:user` / `<prefix>:ws:anonymous`, and forwards received messages to its own clients. Publisher delivers locally + skips its own echoed messages via a per-process origin id. Unset `REDIS_URL` = local-only (single instance unchanged). Built + clippy-clean against redis-rs 0.27.
 3. **DB distributed lock for the scheduler** (#3) — prevents duplicate job execution.

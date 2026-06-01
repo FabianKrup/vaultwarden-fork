@@ -13,15 +13,11 @@ fn main() {
         "You need to enable one DB backend. To build with previous defaults do: cargo build --features sqlite"
     );
 
-    #[cfg(feature = "s3")]
-    println!("cargo:rustc-cfg=s3");
-
     // Use check-cfg to let cargo know which cfg's we define,
     // and avoid warnings when they are used in the code.
     println!("cargo::rustc-check-cfg=cfg(sqlite)");
     println!("cargo::rustc-check-cfg=cfg(mysql)");
     println!("cargo::rustc-check-cfg=cfg(postgresql)");
-    println!("cargo::rustc-check-cfg=cfg(s3)");
 
     // Rerun when these paths are changed.
     // Someone could have checked-out a tag or specific commit, but no other files changed.

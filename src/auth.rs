@@ -63,26 +63,39 @@ static PUBLIC_RSA_KEY: OnceLock<DecodingKey> = OnceLock::new();
 pub async fn initialize_keys() -> Result<(), Error> {
     use std::io::Error as IoError;
 
-    let rsa_key_filename = crate::storage::file_name(&CONFIG.private_rsa_key())
-        .ok_or_else(|| IoError::other("Private RSA key path missing filename"))?;
-
-    let operator = CONFIG.opendal_operator_for_path_type(&PathType::RsaKey).map_err(IoError::other)?;
-
-    let priv_key_buffer = match operator.read(&rsa_key_filename).await {
-        Ok(buffer) => Some(buffer),
-        Err(e) if e.kind() == opendal::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
+    // Stateless mode: load the private key PEM directly from an env var / secret mount.
+    // This bypasses disk/S3 storage and on-boot generation so every replica shares an
+    // identical, deterministic signing key. Read directly from the environment (not via
+    // CONFIG) to keep the secret out of the admin panel, config.json, and logs.
+    let env_priv_key = match env::var("PRIVATE_RSA_KEY_PEM") {
+        Ok(pem) if !pem.trim().is_empty() => Some(pem.into_bytes()),
+        Ok(_) => err!("PRIVATE_RSA_KEY_PEM is set but empty"),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => err!("PRIVATE_RSA_KEY_PEM contains invalid UTF-8"),
     };
 
-    let (priv_key, priv_key_buffer) = if let Some(priv_key_buffer) = priv_key_buffer {
-        (Rsa::private_key_from_pem(priv_key_buffer.to_vec().as_slice())?, priv_key_buffer.to_vec())
+    let priv_key_buffer = if let Some(priv_key_buffer) = env_priv_key {
+        priv_key_buffer
     } else {
-        let rsa_key = Rsa::generate(2048)?;
-        let priv_key_buffer = rsa_key.private_key_to_pem()?;
-        operator.write(&rsa_key_filename, priv_key_buffer.clone()).await?;
-        info!("Private key '{}' created correctly", CONFIG.private_rsa_key());
-        (rsa_key, priv_key_buffer)
+        let rsa_key_filename = crate::storage::file_name(&CONFIG.private_rsa_key())
+            .ok_or_else(|| IoError::other("Private RSA key path missing filename"))?;
+
+        let operator = CONFIG.opendal_operator_for_path_type(&PathType::RsaKey).map_err(IoError::other)?;
+
+        match operator.read(&rsa_key_filename).await {
+            Ok(buffer) => buffer.to_vec(),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                let rsa_key = Rsa::generate(2048)?;
+                let priv_key_buffer = rsa_key.private_key_to_pem()?;
+                operator.write(&rsa_key_filename, priv_key_buffer.clone()).await?;
+                info!("Private key '{}' created correctly", CONFIG.private_rsa_key());
+                priv_key_buffer
+            }
+            Err(e) => return Err(e.into()),
+        }
     };
+
+    let priv_key = Rsa::private_key_from_pem(&priv_key_buffer)?;
     let pub_key_buffer = priv_key.public_key_to_pem()?;
 
     let enc = EncodingKey::from_rsa_pem(&priv_key_buffer)?;

@@ -58,7 +58,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 3 | **Background job scheduler** | Dedicated in-process thread on every replica | Every replica fires every cron job → duplicate emails, races. | `src/main.rs:663` |
 | 4 | **Login rate limiter** | `LIMITER_LOGIN` — in-memory `governor` keyed by IP | Per-replica; effective limit = limit × replicas; bypassable. | `src/ratelimit.rs:9` |
 | 5 | **Admin rate limiter** | `LIMITER_ADMIN` — in-memory | Same as #4. | `src/ratelimit.rs:15` |
-| 6 | **JWT / RSA signing key** | Generated on first boot, written to disk/S3 | No env-injection path; risk of divergence without shared storage; generation is a stateful side effect. | `src/auth.rs:63` |
+| 6 | ✅ **JWT / RSA signing key** | ~~Generated on first boot, written to disk/S3~~ **Resolved:** `PRIVATE_RSA_KEY_PEM` env var injects the key; disk/S3 read + on-boot generation remain the fallback when unset. | ~~No env-injection path~~ Done — see roadmap step 1. | `src/auth.rs:63` |
 | 7 | **`config.json` runtime writes** | Admin panel writes config to disk via opendal | Config read once into immutable `CONFIG` at boot; a write on one replica is invisible to others until restart. | `src/config.rs:1440`, `src/api/admin.rs:797` |
 | 8 | **tmp folder for uploads** | `save_temp_file` lands multipart uploads in local `tmp_folder` | Chunked Send upload (v2) can span requests; if they hit different replicas the partial is lost. | `src/util.rs:878`, `src/config.rs:515` |
 | 9 | **SQLite backup endpoint** | `/admin/config/backup_db` writes a file | Only meaningful for SQLite; N/A under external DB. | `src/db/mod.rs:404`, `src/api/admin.rs:814` |
@@ -79,7 +79,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 1–2 | WebSocket fan-out | Publish every notification to a **Redis pub/sub** channel; every replica subscribes and forwards to its locally-connected clients. In-memory `DashMap` stays as the local connection registry only. Anonymous subscriptions use the same backplane. |
 | 3 | Background jobs | Scheduler acquires a **DB advisory/distributed lock** before each run; only the lock holder executes. Lock auto-expires so a dead leader is replaced. |
 | 4–5 | Rate limiting | Replace in-memory `governor` with a **Redis-backed** limiter keyed by IP, shared across the fleet. |
-| 6 | JWT signing key | Load the private key PEM from an **env var / secret** (e.g. `PRIVATE_RSA_KEY_PEM` or a path provided by the secret mount). Disk/S3 path remains a fallback. No runtime generation in stateless mode. |
+| 6 | JWT signing key | ✅ **Done.** Loads the private key PEM from the **`PRIVATE_RSA_KEY_PEM`** env var / secret mount; disk/S3 path remains a fallback. No runtime generation when the env var is set. |
 | 7 | Runtime config | Treat configuration as **immutable and env-driven**. Disable / make read-only the admin `config.json` write path under a stateless flag (or require a rolling restart to pick up shared-storage config). |
 | 8 | Upload temp | Route multipart temp storage to **shared object storage**, or require **sticky sessions** on the chunked upload endpoints only. |
 | 9 | SQLite backup | Disabled / hidden when DB is not SQLite (already gated by `CAN_BACKUP`). No action beyond confirming it's off. |
@@ -98,7 +98,8 @@ DATA_FOLDER=...                      # only for ephemeral/derived data
 ATTACHMENTS_FOLDER=s3://bucket/attachments?region=...
 SENDS_FOLDER=s3://bucket/sends?region=...
 ICON_CACHE_FOLDER=s3://bucket/icons?region=...
-RSA_KEY_FILENAME=...                 # or new PRIVATE_RSA_KEY_PEM env (target #6)
+PRIVATE_RSA_KEY_PEM=...              # inject JWT signing key (done — #6); overrides RSA_KEY_FILENAME
+RSA_KEY_FILENAME=...                 # fallback when PRIVATE_RSA_KEY_PEM is unset
 # new (target):
 REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 # logging to stdout (no LOG_FILE)
@@ -107,7 +108,7 @@ REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 ## 5. Roadmap
 
 0. **Validate the S3 backend** (§3.1 caveat) — compile with `s3`, exercise upload/download/delete/recursive-purge for attachments + sends + icons against the target object store. Pin the opendal version. Prerequisite for trusting blob storage.
-1. **JWT key injection** (#6) — smallest, unblocks deterministic multi-replica boot.
+1. ✅ **JWT key injection** (#6) — **done.** `PRIVATE_RSA_KEY_PEM` env var, read directly in `initialize_keys` (`src/auth.rs:63`), takes precedence over `RSA_KEY_FILENAME` and disables on-boot generation. Read straight from the env (not `CONFIG`) so the key never reaches the admin panel, `config.json`, or logs. Unblocks deterministic multi-replica boot.
 2. **Redis backplane for WebSocket fan-out** (#1, #2) — core HA blocker; reintroduces the capability the old fork had.
 3. **DB distributed lock for the scheduler** (#3) — prevents duplicate job execution.
 4. **Redis-backed rate limiting** (#4, #5) — correctness across the fleet.

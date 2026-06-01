@@ -130,3 +130,32 @@ _DUO_AKEY=...                        # required if traditional Duo 2FA is enable
 - **Redis HA**: `src/redis_conn.rs` uses a standalone `redis::Client` + `ConnectionManager`. A **single logical endpoint** (managed Redis, or Sentinel behind a proxy/VIP) is a deployment concern — no code change. **Native Redis Cluster** (client-side MOVED/ASK routing + sharded pub/sub) is *not* supported by the standalone client and would need code — tracked as blocker #10 (optional, only if targeting native Cluster).
 - ~~**Upload locality**: shared-storage temp vs. sticky sessions — pick during #8.~~ ✅ Resolved: no chunked upload exists; single-request uploads stream straight to S3, local temp is request-scoped only. No code change.
 - **Push relay**: external Bitwarden push relay remains optional and orthogonal to the Redis backplane.
+
+## 7. Additional Hardening (fork extras)
+
+Security hardening layered on top of the stateless work above. All are **server-side only and transparent to Bitwarden clients** — no protocol change, native apps and the web vault are unaffected. Each is opt-in / backward-compatible (unset = upstream behavior).
+
+| # | Feature | Env | Default | Reference |
+|---|---------|-----|---------|-----------|
+| H1 | **Redis TLS transport** | `REDIS_URL=rediss://…` | plaintext `redis://` | `Cargo.toml` (`tokio-native-tls-comp`), `src/redis_conn.rs` |
+| H2 | **Per-account login throttle** | `LOGIN_ACCOUNT_RATELIMIT_SECONDS` / `LOGIN_ACCOUNT_RATELIMIT_MAX_BURST` | 60s / burst 5 | `src/ratelimit.rs` (`check_limit_login_account`), `src/api/identity.rs` (`password_login`) |
+| H3 | **JWT signing-key rotation** | `PUBLIC_RSA_KEY_PEM_PREVIOUS` | unset (no rotation) | `src/auth.rs` (`initialize_keys`, `decode_jwt`) |
+
+### H1 — Redis TLS
+
+The Redis crate is now built with `tokio-native-tls-comp`, so a `rediss://` `REDIS_URL` negotiates TLS (system openssl, OS CA store) for the WebSocket backplane **and** the shared rate-limit traffic — both carry auth-relevant data (client IPs, hashed usernames, notification payloads) that previously crossed the wire in plaintext. `redis://` URLs are unchanged. Works out-of-box with managed Redis (ElastiCache / Memorystore); private/internal CAs must be in the OS trust store.
+
+### H2 — Per-account login throttle
+
+The existing limiter (`check_limit_login`) keys by **IP**, so a botnet spreading attempts across many IPs against one account stays under the per-IP ceiling. `check_limit_login_account` adds a second token bucket keyed by the **hashed username** (`crypto::sha256_hex` of the lowercased, trimmed email — the raw email never becomes a Redis key). It runs in `password_login` before the user lookup, so it also throttles username-enumeration. Shared across the fleet via the same Redis token-bucket Lua when `REDIS_URL` is set; falls back to a per-replica in-memory `governor` otherwise. On trip it returns the same `429 Too many login requests` clients already handle.
+
+> **Known limitation / TODO.** A token is consumed on **every** attempt (mirrors the IP limiter), so repeated *correct* logins also count against the account's bucket. Tracked to switch to consuming **only on failed attempts** (check moved past password verification) so a valid password never penalizes the account.
+
+### H3 — JWT signing-key rotation
+
+Signing stays on `PRIVATE_RSA_KEY_PEM`. Setting `PUBLIC_RSA_KEY_PEM_PREVIOUS` (the **public** PEM of the retired key) lets `decode_jwt` accept tokens still signed by the old key: the current key is tried first, and **only on a signature mismatch** (`ErrorKind::InvalidSignature`) is the previous key retried — `exp`/`nbf`/`issuer` are validated identically, so expiry/issuer failures are never masked. This makes a rolling key change zero-downtime across replicas. Read straight from the env (not `CONFIG`) to keep keys out of the admin panel, `config.json`, and logs.
+
+**Rotation procedure:**
+1. Set `PUBLIC_RSA_KEY_PEM_PREVIOUS` = public PEM of the **current** key.
+2. Set `PRIVATE_RSA_KEY_PEM` = the **new** private key. Rolling-restart.
+3. After the longest token lifetime elapses (refresh token, default 30d → see `DEFAULT_REFRESH_VALIDITY` / `MOBILE_REFRESH_VALIDITY` 90d), unset `PUBLIC_RSA_KEY_PEM_PREVIOUS`. Rolling-restart.

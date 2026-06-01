@@ -360,6 +360,11 @@ async fn password_login(
 
     // Get the user
     let username = data.username.as_ref().unwrap().trim();
+
+    // Per-account throttle: caps attempts against a single username across the fleet, defending the
+    // distributed brute force (many IPs, one account) that the per-IP limit above cannot see.
+    crate::ratelimit::check_limit_login_account(username).await?;
+
     let Some(mut user) = User::find_by_mail(username, conn).await else {
         err!("Username or password is incorrect. Try again", format!("IP: {}. Username: {username}.", ip.ip))
     };

@@ -59,6 +59,10 @@ static JWT_2FA_REMEMBER_ISSUER: LazyLock<String> = LazyLock::new(|| format!("{}|
 
 static PRIVATE_RSA_KEY: OnceLock<EncodingKey> = OnceLock::new();
 static PUBLIC_RSA_KEY: OnceLock<DecodingKey> = OnceLock::new();
+// Optional verify-only key for zero-downtime signing-key rotation. When `PUBLIC_RSA_KEY_PEM_PREVIOUS`
+// is set, tokens still signed by the retired key validate against it during the overlap window.
+// `None` once initialized = rotation not in progress. See `decode_jwt`.
+static PUBLIC_RSA_KEY_PREVIOUS: OnceLock<Option<DecodingKey>> = OnceLock::new();
 
 pub async fn initialize_keys() -> Result<(), Error> {
     use std::io::Error as IoError;
@@ -100,11 +104,30 @@ pub async fn initialize_keys() -> Result<(), Error> {
 
     let enc = EncodingKey::from_rsa_pem(&priv_key_buffer)?;
     let dec: DecodingKey = DecodingKey::from_rsa_pem(&pub_key_buffer)?;
+
+    // Zero-downtime signing-key rotation: an optional retired public key (verify-only). Tokens
+    // issued before the rotation are still signed by it, so accept them until the overlap window
+    // closes. Read directly from the env (like PRIVATE_RSA_KEY_PEM) to keep it out of CONFIG/logs.
+    let prev_dec = match env::var("PUBLIC_RSA_KEY_PEM_PREVIOUS") {
+        Ok(pem) if !pem.trim().is_empty() => {
+            let dec = DecodingKey::from_rsa_pem(pem.as_bytes())
+                .map_err(|e| IoError::other(format!("PUBLIC_RSA_KEY_PEM_PREVIOUS is invalid: {e}")))?;
+            info!("Loaded previous JWT verification key (PUBLIC_RSA_KEY_PEM_PREVIOUS) for rotation");
+            Some(dec)
+        }
+        Ok(_) => err!("PUBLIC_RSA_KEY_PEM_PREVIOUS is set but empty"),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => err!("PUBLIC_RSA_KEY_PEM_PREVIOUS contains invalid UTF-8"),
+    };
+
     if PRIVATE_RSA_KEY.set(enc).is_err() {
         err!("PRIVATE_RSA_KEY must only be initialized once")
     }
     if PUBLIC_RSA_KEY.set(dec).is_err() {
         err!("PUBLIC_RSA_KEY must only be initialized once")
+    }
+    if PUBLIC_RSA_KEY_PREVIOUS.set(prev_dec).is_err() {
+        err!("PUBLIC_RSA_KEY_PREVIOUS must only be initialized once")
     }
     Ok(())
 }
@@ -126,6 +149,16 @@ pub fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T,
     let token = token.replace(char::is_whitespace, "");
     match jsonwebtoken::decode(&token, PUBLIC_RSA_KEY.wait(), &validation) {
         Ok(d) => Ok(d.claims),
+        // Only the signature differs between keys — exp/nbf/issuer are validated identically — so
+        // during rotation retry a signature mismatch against the retired key before giving up.
+        Err(err) if matches!(err.kind(), ErrorKind::InvalidSignature) => {
+            if let Some(prev) = PUBLIC_RSA_KEY_PREVIOUS.wait().as_ref()
+                && let Ok(d) = jsonwebtoken::decode(&token, prev, &validation)
+            {
+                return Ok(d.claims);
+            }
+            err!("Token is invalid")
+        }
         Err(err) => match *err.kind() {
             ErrorKind::InvalidToken => err!("Token is invalid"),
             ErrorKind::InvalidIssuer => err!("Issuer is invalid"),

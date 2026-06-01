@@ -18,6 +18,7 @@ static MANAGER: OnceLock<Mutex<Option<redis::aio::ConnectionManager>>> = OnceLoc
 
 /// Open the shared Redis client at boot. Returns `Err` only on a malformed `REDIS_URL`; a missing
 /// `REDIS_URL` is fine (single-instance / local-only) and opening does not connect to Redis.
+/// A `rediss://` URL enables TLS (native-tls / OS CA store) for encrypted transport to Redis.
 pub fn init() -> Result<(), Error> {
     use std::io::Error as IoError;
 

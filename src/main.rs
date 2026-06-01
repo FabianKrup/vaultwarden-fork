@@ -605,6 +605,9 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     spawn_shutdown_signal_handler();
 
+    // Start the Redis WebSocket backplane for multi-replica fan-out (no-op when REDIS_URL is unset).
+    api::start_ws_backplane().await?;
+
     #[cfg(all(unix, sqlite))]
     {
         if db::ACTIVE_DB_TYPE.get() == Some(&db::DbConnType::Sqlite) {

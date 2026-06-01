@@ -53,8 +53,8 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 
 | # | Component | Current behavior | Problem | Reference |
 |---|-----------|------------------|---------|-----------|
-| 1 | **WebSocket live-sync** | `WS_USERS` — in-memory `DashMap<user, [senders]>` | Process-local. Client on replica A never receives updates produced on replica B. | `src/api/notifications.rs:27` |
-| 2 | **Anonymous WebSocket subscriptions** | `WS_ANONYMOUS_SUBSCRIPTIONS` — in-memory `DashMap` | Same as #1, for passwordless auth-request flow. | `src/api/notifications.rs:33` |
+| 1 | ✅ **WebSocket live-sync** | `WS_USERS` `DashMap` is now a **local registry only**; updates publish to a Redis pub/sub channel and every replica forwards to its own clients. | ~~Process-local~~ **Resolved** via `REDIS_URL` backplane — see roadmap step 2. Unset = local-only (single instance). | `src/api/notifications.rs:27`, backplane at `start_backplane`/`run_subscriber` |
+| 2 | ✅ **Anonymous WebSocket subscriptions** | `WS_ANONYMOUS_SUBSCRIPTIONS` — same backplane, separate channel. | **Resolved** with #1. | `src/api/notifications.rs:33` |
 | 3 | **Background job scheduler** | Dedicated in-process thread on every replica | Every replica fires every cron job → duplicate emails, races. | `src/main.rs:663` |
 | 4 | **Login rate limiter** | `LIMITER_LOGIN` — in-memory `governor` keyed by IP | Per-replica; effective limit = limit × replicas; bypassable. | `src/ratelimit.rs:9` |
 | 5 | **Admin rate limiter** | `LIMITER_ADMIN` — in-memory | Same as #4. | `src/ratelimit.rs:15` |
@@ -76,7 +76,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 
 | # | Component | Target |
 |---|-----------|--------|
-| 1–2 | WebSocket fan-out | Publish every notification to a **Redis pub/sub** channel; every replica subscribes and forwards to its locally-connected clients. In-memory `DashMap` stays as the local connection registry only. Anonymous subscriptions use the same backplane. |
+| 1–2 | WebSocket fan-out | ✅ **Done.** Publishes every notification to a **Redis pub/sub** channel (`REDIS_URL`); every replica subscribes and forwards to its locally-connected clients. In-memory `DashMap` stays as the local connection registry only. Anonymous subscriptions use the same backplane (separate channel). |
 | 3 | Background jobs | Scheduler acquires a **DB advisory/distributed lock** before each run; only the lock holder executes. Lock auto-expires so a dead leader is replaced. |
 | 4–5 | Rate limiting | Replace in-memory `governor` with a **Redis-backed** limiter keyed by IP, shared across the fleet. |
 | 6 | JWT signing key | ✅ **Done.** Loads the private key PEM from the **`PRIVATE_RSA_KEY_PEM`** env var / secret mount; disk/S3 path remains a fallback. No runtime generation when the env var is set. |
@@ -109,7 +109,7 @@ REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 
 0. **Validate the S3 backend** (§3.1 caveat) — compile with `s3`, exercise upload/download/delete/recursive-purge for attachments + sends + icons against the target object store. Pin the opendal version. Prerequisite for trusting blob storage.
 1. ✅ **JWT key injection** (#6) — **done.** `PRIVATE_RSA_KEY_PEM` env var, read directly in `initialize_keys` (`src/auth.rs:63`), takes precedence over `RSA_KEY_FILENAME` and disables on-boot generation. Read straight from the env (not `CONFIG`) so the key never reaches the admin panel, `config.json`, or logs. Unblocks deterministic multi-replica boot.
-2. **Redis backplane for WebSocket fan-out** (#1, #2) — core HA blocker; reintroduces the capability the old fork had.
+2. ✅ **Redis backplane for WebSocket fan-out** (#1, #2) — **done.** `REDIS_URL` enables a Redis pub/sub backplane (`src/api/notifications.rs`): each replica keeps its `DashMap` as a local registry, publishes updates to `<prefix>:ws:user` / `<prefix>:ws:anonymous`, and forwards received messages to its own clients. Publisher delivers locally + skips its own echoed messages via a per-process origin id. Unset `REDIS_URL` = local-only (single instance unchanged). Built + clippy-clean against redis-rs 0.27.
 3. **DB distributed lock for the scheduler** (#3) — prevents duplicate job execution.
 4. **Redis-backed rate limiting** (#4, #5) — correctness across the fleet.
 5. **Immutable config mode** (#7) — flag to disable admin config writes.

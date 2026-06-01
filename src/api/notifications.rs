@@ -1,6 +1,6 @@
 use std::{
     net::IpAddr,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, OnceLock},
     time::Duration,
 };
 
@@ -37,6 +37,24 @@ pub static WS_ANONYMOUS_SUBSCRIPTIONS: LazyLock<Arc<AnonymousWebSocketSubscripti
 });
 
 static NOTIFICATIONS_DISABLED: LazyLock<bool> = LazyLock::new(|| !CONFIG.enable_websocket() && !CONFIG.push_enabled());
+
+// Unique per-process id so a replica can ignore the backplane messages it published itself.
+static WS_ORIGIN_ID: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
+
+// Set once at startup when a Redis URL is configured; absent means single-instance/local-only.
+static REDIS_BACKPLANE: OnceLock<RedisBackplane> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum WsChannel {
+    User,
+    Anonymous,
+}
+
+struct RedisBackplane {
+    publisher: redis::aio::ConnectionManager,
+    user_channel: String,
+    anon_channel: String,
+}
 
 pub fn routes() -> Vec<Route> {
     if CONFIG.enable_websocket() {
@@ -328,8 +346,18 @@ pub struct WebSocketUsers {
 }
 
 impl WebSocketUsers {
+    // Deliver to this replica's locally-connected clients, then publish to the Redis
+    // backplane so the other replicas can deliver to theirs. publish_ws is a no-op when
+    // no backplane is configured, leaving single-instance behavior unchanged.
     async fn send_update(&self, user_id: &UserId, data: &[u8]) {
-        if let Some(user) = self.map.get(user_id.as_ref()).map(|v| v.clone()) {
+        self.send_update_local(user_id.as_ref(), data).await;
+        publish_ws(WsChannel::User, user_id.as_ref(), data).await;
+    }
+
+    // Deliver to locally-connected clients only. Used for both direct sends and for
+    // messages received from the backplane (which must not be re-published).
+    async fn send_update_local(&self, user_id: &str, data: &[u8]) {
+        if let Some(user) = self.map.get(user_id).map(|v| v.clone()) {
             for (_, sender) in &user {
                 if let Err(e) = sender.send(Message::binary(data)).await {
                     error!("Error sending WS update {e}");
@@ -539,6 +567,11 @@ pub struct AnonymousWebSocketSubscriptions {
 
 impl AnonymousWebSocketSubscriptions {
     async fn send_update(&self, token: &str, data: &[u8]) {
+        self.send_update_local(token, data).await;
+        publish_ws(WsChannel::Anonymous, token, data).await;
+    }
+
+    async fn send_update_local(&self, token: &str, data: &[u8]) {
         if let Some(sender) = self.map.get(token).map(|v| v.clone())
             && let Err(e) = sender.send(Message::binary(data)).await
         {
@@ -655,3 +688,124 @@ pub enum UpdateType {
 
 pub type Notify<'a> = &'a rocket::State<Arc<WebSocketUsers>>;
 pub type AnonymousNotify<'a> = &'a rocket::State<Arc<AnonymousWebSocketSubscriptions>>;
+
+//
+// Redis pub/sub backplane (multi-replica WebSocket fan-out)
+//
+// Each replica keeps its DashMap as a purely local connection registry. Outgoing updates
+// are published to a Redis channel carrying [origin_id, target, payload]; every replica
+// subscribes and re-delivers to its own locally-connected clients. The publisher skips its
+// own messages (matched by origin_id) since it already delivered them directly.
+
+fn encode_envelope(target: &str, payload: &[u8]) -> Vec<u8> {
+    use rmpv::Value as V;
+
+    let value = V::Array(vec![WS_ORIGIN_ID.to_string().into(), target.into(), V::Binary(payload.to_vec())]);
+
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &value).expect("Error encoding WS backplane envelope");
+    buf
+}
+
+fn decode_envelope(bytes: &[u8]) -> Option<(String, String, Vec<u8>)> {
+    use rmpv::Value as V;
+
+    let value = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
+    let V::Array(parts) = value else {
+        return None;
+    };
+    match parts.as_slice() {
+        [V::String(origin), V::String(target), V::Binary(payload)] => {
+            Some((origin.as_str()?.to_owned(), target.as_str()?.to_owned(), payload.clone()))
+        }
+        _ => None,
+    }
+}
+
+async fn publish_ws(channel: WsChannel, target: &str, payload: &[u8]) {
+    let Some(backplane) = REDIS_BACKPLANE.get() else {
+        return;
+    };
+    let chan = match channel {
+        WsChannel::User => &backplane.user_channel,
+        WsChannel::Anonymous => &backplane.anon_channel,
+    };
+
+    let envelope = encode_envelope(target, payload);
+    let mut conn = backplane.publisher.clone();
+    if let Err(e) = redis::cmd("PUBLISH").arg(chan).arg(envelope).query_async::<()>(&mut conn).await {
+        error!("Failed to publish WS update to Redis: {e}");
+    }
+}
+
+// Initializes the Redis backplane when REDIS_URL is set. Fails the boot if Redis is
+// configured but unreachable so the orchestrator restarts the pod until it is. The
+// subscriber task reconnects on its own for transient runtime errors.
+pub async fn start_backplane() -> Result<(), Error> {
+    use std::io::Error as IoError;
+
+    let Some(url) = CONFIG.redis_url() else {
+        return Ok(());
+    };
+    if !CONFIG.enable_websocket() {
+        info!("REDIS_URL is set but WebSockets are disabled; backplane not started.");
+        return Ok(());
+    }
+
+    let prefix = CONFIG.redis_channel_prefix();
+    let user_channel = format!("{prefix}:ws:user");
+    let anon_channel = format!("{prefix}:ws:anonymous");
+
+    let client = redis::Client::open(url).map_err(IoError::other)?;
+    let publisher = redis::aio::ConnectionManager::new(client.clone()).await.map_err(IoError::other)?;
+
+    if REDIS_BACKPLANE
+        .set(RedisBackplane {
+            publisher,
+            user_channel: user_channel.clone(),
+            anon_channel: anon_channel.clone(),
+        })
+        .is_err()
+    {
+        err!("Redis backplane must only be initialized once");
+    }
+
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = run_subscriber(&client, &user_channel, &anon_channel).await {
+                error!("Redis WS subscriber disconnected: {e}. Reconnecting in 5s.");
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    info!("Redis WebSocket backplane connected (origin {})", *WS_ORIGIN_ID);
+    Ok(())
+}
+
+async fn run_subscriber(client: &redis::Client, user_channel: &str, anon_channel: &str) -> redis::RedisResult<()> {
+    let mut pubsub = client.get_async_pubsub().await?;
+    pubsub.subscribe(user_channel).await?;
+    pubsub.subscribe(anon_channel).await?;
+
+    let origin = WS_ORIGIN_ID.to_string();
+    let mut stream = pubsub.on_message();
+    while let Some(msg) = stream.next().await {
+        let channel = msg.get_channel_name().to_owned();
+        let payload: Vec<u8> = msg.get_payload()?;
+        let Some((msg_origin, target, data)) = decode_envelope(&payload) else {
+            warn!("Discarding malformed WS backplane message");
+            continue;
+        };
+        // Skip messages this replica published; it already delivered them locally.
+        if msg_origin == origin {
+            continue;
+        }
+        if channel == user_channel {
+            WS_USERS.send_update_local(&target, &data).await;
+        } else if channel == anon_channel {
+            WS_ANONYMOUS_SUBSCRIPTIONS.send_update_local(&target, &data).await;
+        }
+    }
+    Ok(())
+}

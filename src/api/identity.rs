@@ -362,10 +362,14 @@ async fn password_login(
     let username = data.username.as_ref().unwrap().trim();
 
     // Per-account throttle: caps attempts against a single username across the fleet, defending the
-    // distributed brute force (many IPs, one account) that the per-IP limit above cannot see.
-    crate::ratelimit::check_limit_login_account(username).await?;
+    // distributed brute force (many IPs, one account) that the per-IP limit above cannot see. This
+    // upfront call only *peeks* (Redis-backed) to reject an already-drained bucket before the
+    // password verification below; tokens are drained by `penalize_login_account` on failure only,
+    // so a correct password never penalizes the account.
+    crate::ratelimit::peek_limit_login_account(username).await?;
 
     let Some(mut user) = User::find_by_mail(username, conn).await else {
+        crate::ratelimit::penalize_login_account(username).await?;
         err!("Username or password is incorrect. Try again", format!("IP: {}. Username: {username}.", ip.ip))
     };
 
@@ -374,6 +378,7 @@ async fn password_login(
 
     // Check if the user is disabled
     if !user.enabled {
+        crate::ratelimit::penalize_login_account(username).await?;
         err!(
             "This user has been disabled",
             format!("IP: {}. Username: {username}.", ip.ip),
@@ -406,6 +411,7 @@ async fn password_login(
             || ip.ip.to_string() != auth_request.request_ip
             || !auth_request.check_access_code(password)
         {
+            crate::ratelimit::penalize_login_account(username).await?;
             err!(
                 "Username or access code is incorrect. Try again",
                 format!("IP: {}. Username: {username}.", ip.ip),
@@ -415,6 +421,7 @@ async fn password_login(
             )
         }
     } else if !user.check_valid_password(password) {
+        crate::ratelimit::penalize_login_account(username).await?;
         err!(
             "Username or password is incorrect. Try again",
             format!("IP: {}. Username: {username}.", ip.ip),

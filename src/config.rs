@@ -761,6 +761,9 @@ make_config! {
         /// Bypass admin page security (Know the risks!) |> Disables the Admin Token for the admin page so you may use your own auth in-front
         disable_admin_token:    bool,   false,  def,    false;
 
+        /// Immutable configuration |> When enabled, the admin panel cannot write config.json and config.json is ignored at boot; configuration comes only from environment variables. For stateless/multi-replica deployments.
+        immutable_config:       bool,   false,  def,    false;
+
         /// Allowed iframe ancestors (Know the risks!) |> Allows other domains to embed the web vault into an iframe, useful for embedding into secure intranets
         allowed_iframe_ancestors: String, true, def,    String::new();
 
@@ -1422,7 +1425,12 @@ impl Config {
     pub async fn load() -> Result<Self, Error> {
         // Loading from env and file
         let env = ConfigBuilder::from_env();
-        let usr = ConfigBuilder::from_file().await.unwrap_or_default();
+        let usr = if env.build().immutable_config {
+            println!("[INFO] IMMUTABLE_CONFIG enabled: ignoring config.json; configuration is env-only.\n");
+            ConfigBuilder::default()
+        } else {
+            ConfigBuilder::from_file().await.unwrap_or_default()
+        };
 
         // Create merged config, config file overwrites env
         let mut overrides = Vec::new();

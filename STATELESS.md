@@ -59,7 +59,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 4 | **Login rate limiter** | `LIMITER_LOGIN` — in-memory `governor` keyed by IP | Per-replica; effective limit = limit × replicas; bypassable. | `src/ratelimit.rs:9` |
 | 5 | **Admin rate limiter** | `LIMITER_ADMIN` — in-memory | Same as #4. | `src/ratelimit.rs:15` |
 | 6 | ✅ **JWT / RSA signing key** | ~~Generated on first boot, written to disk/S3~~ **Resolved:** `PRIVATE_RSA_KEY_PEM` env var injects the key; disk/S3 read + on-boot generation remain the fallback when unset. | ~~No env-injection path~~ Done — see roadmap step 1. | `src/auth.rs:63` |
-| 7 | **`config.json` runtime writes** | Admin panel writes config to disk via opendal | Config read once into immutable `CONFIG` at boot; a write on one replica is invisible to others until restart. | `src/config.rs:1440`, `src/api/admin.rs:797` |
+| 7 | ✅ **`config.json` runtime writes** | ~~Admin panel writes config to disk via opendal~~ **Resolved:** `IMMUTABLE_CONFIG` env flag refuses admin config writes (`post_config`/`delete_config`) and makes `Config::load` skip reading `config.json` — config becomes env-only. | ~~Write on one replica invisible to others until restart~~ Done — see roadmap step 5. Unset = behavior unchanged. | `src/config.rs` (`load` gate + `immutable_config`), `src/api/admin.rs:798,807` |
 | 8 | **tmp folder for uploads** | `save_temp_file` lands multipart uploads in local `tmp_folder` | Chunked Send upload (v2) can span requests; if they hit different replicas the partial is lost. | `src/util.rs:878`, `src/config.rs:515` |
 | 9 | ✅ **SQLite backup endpoint** | `/admin/config/backup_db` writes a file | **No action needed:** already gated by `CAN_BACKUP`, which is `false` whenever the DB is not SQLite, so the endpoint returns an error under external Postgres/MySQL. | `src/api/admin.rs:96-98` (gate), `src/api/admin.rs:816` (guard) |
 
@@ -80,7 +80,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 3 | Background jobs | Scheduler acquires a **DB advisory/distributed lock** before each run; only the lock holder executes. Lock auto-expires so a dead leader is replaced. |
 | 4–5 | Rate limiting | Replace in-memory `governor` with a **Redis-backed** limiter keyed by IP, shared across the fleet. |
 | 6 | JWT signing key | ✅ **Done.** Loads the private key PEM from the **`PRIVATE_RSA_KEY_PEM`** env var / secret mount; disk/S3 path remains a fallback. No runtime generation when the env var is set. |
-| 7 | Runtime config | Treat configuration as **immutable and env-driven**. Disable / make read-only the admin `config.json` write path under a stateless flag (or require a rolling restart to pick up shared-storage config). |
+| 7 | Runtime config | ✅ **Done.** `IMMUTABLE_CONFIG` makes configuration **immutable and env-driven**: admin `config.json` writes are refused and `config.json` is ignored at boot, so env is the sole source of truth. Change config via env + rolling restart. |
 | 8 | Upload temp | Route multipart temp storage to **shared object storage**, or require **sticky sessions** on the chunked upload endpoints only. |
 | 9 | SQLite backup | ✅ **Confirmed off.** Disabled when DB is not SQLite — already gated by `CAN_BACKUP` (`src/api/admin.rs:96-98`). No code change needed. |
 
@@ -112,7 +112,7 @@ REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 2. ✅ **Redis backplane for WebSocket fan-out** (#1, #2) — **done.** `REDIS_URL` enables a Redis pub/sub backplane (`src/api/notifications.rs`): each replica keeps its `DashMap` as a local registry, publishes updates to `<prefix>:ws:user` / `<prefix>:ws:anonymous`, and forwards received messages to its own clients. Publisher delivers locally + skips its own echoed messages via a per-process origin id. Unset `REDIS_URL` = local-only (single instance unchanged). Built + clippy-clean against redis-rs 0.27.
 3. **DB distributed lock for the scheduler** (#3) — prevents duplicate job execution.
 4. **Redis-backed rate limiting** (#4, #5) — correctness across the fleet.
-5. **Immutable config mode** (#7) — flag to disable admin config writes.
+5. ✅ **Immutable config mode** (#7) — **done.** `IMMUTABLE_CONFIG` env flag refuses admin config writes (`post_config`/`delete_config`, `src/api/admin.rs`) and makes `Config::load` skip `config.json` (`src/config.rs`), so config is env-only and identical across replicas. Unset = unchanged. Note: traditional Duo 2FA deployments must set `_DUO_AKEY` via env (the auto-generated AKey is otherwise persisted to `config.json`).
 6. **Upload temp locality** (#8) — shared-storage temp or documented sticky-session requirement.
 7. **Docs / deploy manifests** — example k8s + env reference; ~~confirm SQLite backup is gated off (#9)~~ ✅ #9 confirmed gated by `CAN_BACKUP`.
 

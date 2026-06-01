@@ -775,11 +775,6 @@ make_config! {
         /// Max burst size for login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `login_ratelimit_seconds`. Note that this applies to both the login and the 2FA, so it's recommended to allow a burst size of at least 2
         login_ratelimit_max_burst:     u32, false, def, 10;
 
-        /// Seconds between login requests per account |> Number of seconds, on average, between password-login attempts for the same username before rate limiting kicks in. Keyed by account (not IP) to throttle distributed brute force; shared across replicas when `redis_url` is set, else per-replica.
-        login_account_ratelimit_seconds:   u64, false, def, 60;
-        /// Max burst size for per-account login requests |> Allow a burst of password-login attempts of up to this size for the same username, while maintaining the average indicated by `login_account_ratelimit_seconds`.
-        login_account_ratelimit_max_burst: u32, false, def, 5;
-
         /// Seconds between admin login requests |> Number of seconds, on average, between admin requests from the same IP address before rate limiting kicks in
         admin_ratelimit_seconds:       u64, false, def, 300;
         /// Max burst size for admin login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `admin_ratelimit_seconds`

@@ -138,20 +138,13 @@ Security hardening layered on top of the stateless work above. All are **server-
 | # | Feature | Env | Default | Reference |
 |---|---------|-----|---------|-----------|
 | H1 | **Redis TLS transport** | `REDIS_URL=rediss://…` | plaintext `redis://` | `Cargo.toml` (`tokio-native-tls-comp`), `src/redis_conn.rs` |
-| H2 | **Per-account login throttle** | `LOGIN_ACCOUNT_RATELIMIT_SECONDS` / `LOGIN_ACCOUNT_RATELIMIT_MAX_BURST` | 60s / burst 5 | `src/ratelimit.rs` (`peek_limit_login_account` / `penalize_login_account`), `src/api/identity.rs` (`password_login`) |
-| H3 | **JWT signing-key rotation** | `PUBLIC_RSA_KEY_PEM_PREVIOUS` | unset (no rotation) | `src/auth.rs` (`initialize_keys`, `decode_jwt`) |
+| H2 | **JWT signing-key rotation** | `PUBLIC_RSA_KEY_PEM_PREVIOUS` | unset (no rotation) | `src/auth.rs` (`initialize_keys`, `decode_jwt`) |
 
 ### H1 — Redis TLS
 
 The Redis crate is now built with `tokio-native-tls-comp`, so a `rediss://` `REDIS_URL` negotiates TLS (system openssl, OS CA store) for the WebSocket backplane **and** the shared rate-limit traffic — both carry auth-relevant data (client IPs, hashed usernames, notification payloads) that previously crossed the wire in plaintext. `redis://` URLs are unchanged. Works out-of-box with managed Redis (ElastiCache / Memorystore); private/internal CAs must be in the OS trust store.
 
-### H2 — Per-account login throttle
-
-The existing limiter (`check_limit_login`) keys by **IP**, so a botnet spreading attempts across many IPs against one account stays under the per-IP ceiling. The per-account bucket keys by the **hashed username** (`crypto::sha256_hex` of the lowercased, trimmed email — the raw email never becomes a Redis key). Shared across the fleet via the same Redis token-bucket Lua when `REDIS_URL` is set; falls back to a per-replica in-memory `governor` otherwise. On trip it returns the same `429 Too many login requests` clients already handle.
-
-**A token is drained only on a *failed* attempt, so a correct password never penalizes the account.** The flow splits into two operations: `peek_limit_login_account` runs upfront in `password_login` (non-consuming) and rejects an already-drained bucket before the expensive password verification; `penalize_login_account` drains one token on each failure path (user-not-found, disabled, bad access code, bad password — username-enumeration included), and returns 429 once the bucket is empty. The upfront peek is Redis-only (the `governor` fallback cannot peek without consuming); when `REDIS_URL` is unset the limit is enforced lazily by the failure-path drains instead. A failed 2FA after a correct password does **not** drain the bucket (it is past password verification).
-
-### H3 — JWT signing-key rotation
+### H2 — JWT signing-key rotation
 
 Signing stays on `PRIVATE_RSA_KEY_PEM`. Setting `PUBLIC_RSA_KEY_PEM_PREVIOUS` (the **public** PEM of the retired key) lets `decode_jwt` accept tokens still signed by the old key: the current key is tried first, and **only on a signature mismatch** (`ErrorKind::InvalidSignature`) is the previous key retried — `exp`/`nbf`/`issuer` are validated identically, so expiry/issuer failures are never masked. This makes a rolling key change zero-downtime across replicas. Read straight from the env (not `CONFIG`) to keep keys out of the admin panel, `config.json`, and logs.
 

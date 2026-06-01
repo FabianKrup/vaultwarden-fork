@@ -33,7 +33,7 @@ use std::{
     path::Path,
     process::exit,
     str::FromStr,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, LazyLock, atomic::{AtomicBool, Ordering}},
     thread,
 };
 
@@ -663,6 +663,13 @@ fn spawn_shutdown_signal_handler() {
     });
 }
 
+// Per-process identity + leadership flag for the DB scheduler lease (STATELESS #3).
+// Only the lease holder runs the cron jobs; every replica keeps ticking so its
+// per-job baseline stays current for clean failover. A fresh uuid per process means
+// a restarted replica simply re-competes for the lease.
+static SCHEDULER_IS_LEADER: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_HOLDER_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+
 fn schedule_jobs(pool: db::DbPool) {
     if CONFIG.job_poll_interval_ms() == 0 {
         info!("Job scheduler disabled.");
@@ -679,17 +686,25 @@ fn schedule_jobs(pool: db::DbPool) {
 
             let mut sched = JobScheduler::new();
 
+            // Each job only runs on the replica that currently holds the scheduler
+            // lease (see the loop below). The `if SCHEDULER_IS_LEADER` guard gates the
+            // work, not the tick, so non-leaders keep their per-job baseline current.
+
             // Purge sends that are past their deletion date.
             if !CONFIG.send_purge_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.send_purge_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::purge_sends(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(api::purge_sends(pool.clone()));
+                    }
                 }));
             }
 
             // Purge trashed items that are old enough to be auto-deleted.
             if !CONFIG.trash_purge_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.trash_purge_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::purge_trashed_ciphers(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(api::purge_trashed_ciphers(pool.clone()));
+                    }
                 }));
             }
 
@@ -697,7 +712,9 @@ fn schedule_jobs(pool: db::DbPool) {
             // indicates that a user's master password has been compromised.
             if !CONFIG.incomplete_2fa_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.incomplete_2fa_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::send_incomplete_2fa_notifications(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(api::send_incomplete_2fa_notifications(pool.clone()));
+                    }
                 }));
             }
 
@@ -706,7 +723,9 @@ fn schedule_jobs(pool: db::DbPool) {
             // sending reminders for requests that are about to be granted anyway.
             if !CONFIG.emergency_request_timeout_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.emergency_request_timeout_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::emergency_request_timeout_job(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(api::emergency_request_timeout_job(pool.clone()));
+                    }
                 }));
             }
 
@@ -714,20 +733,26 @@ fn schedule_jobs(pool: db::DbPool) {
             // emergency access requests.
             if !CONFIG.emergency_notification_reminder_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.emergency_notification_reminder_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::emergency_notification_reminder_job(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(api::emergency_notification_reminder_job(pool.clone()));
+                    }
                 }));
             }
 
             if !CONFIG.auth_request_purge_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.auth_request_purge_schedule().parse().unwrap(), || {
-                    runtime.spawn(purge_auth_requests(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(purge_auth_requests(pool.clone()));
+                    }
                 }));
             }
 
             // Clean unused, expired Duo authentication contexts.
             if !CONFIG.duo_context_purge_schedule().is_empty() && CONFIG._enable_duo() && !CONFIG.duo_use_iframe() {
                 sched.add(Job::new(CONFIG.duo_context_purge_schedule().parse().unwrap(), || {
-                    runtime.spawn(purge_duo_contexts(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(purge_duo_contexts(pool.clone()));
+                    }
                 }));
             }
 
@@ -737,16 +762,25 @@ fn schedule_jobs(pool: db::DbPool) {
                 && CONFIG.events_days_retain().is_some()
             {
                 sched.add(Job::new(CONFIG.event_cleanup_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::event_cleanup_job(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(api::event_cleanup_job(pool.clone()));
+                    }
                 }));
             }
 
             // Purge sso auth from incomplete flow (default to daily at 00h20).
             if !CONFIG.purge_incomplete_sso_auth().is_empty() {
                 sched.add(Job::new(CONFIG.purge_incomplete_sso_auth().parse().unwrap(), || {
-                    runtime.spawn(db::models::SsoAuth::delete_expired(pool.clone()));
+                    if SCHEDULER_IS_LEADER.load(Ordering::Relaxed) {
+                        runtime.spawn(db::models::SsoAuth::delete_expired(pool.clone()));
+                    }
                 }));
             }
+
+            // Lease TTL = 3x the poll interval, so a dead leader's lease expires within
+            // a few ticks and another replica takes over (STATELESS #3). Poll interval
+            // is non-zero here (the == 0 case returned early above).
+            let lease_ttl_ms = CONFIG.job_poll_interval_ms().saturating_mul(3);
 
             // Periodically check for jobs to run. We probably won't need any
             // jobs that run more often than once a minute, so a default poll
@@ -758,6 +792,26 @@ fn schedule_jobs(pool: db::DbPool) {
             // were added, so if two jobs are both eligible to run at a given
             // tick, the one that was added earlier will run first.
             loop {
+                // Acquire or renew the DB scheduler lease before each tick. Only the
+                // lease holder executes job work; fail-closed if the DB is unreachable.
+                let leader = runtime.block_on(async {
+                    match pool.get().await {
+                        Ok(conn) => {
+                            db::models::JobLock::try_acquire(&conn, SCHEDULER_HOLDER_ID.as_str(), lease_ttl_ms).await
+                        }
+                        Err(e) => {
+                            error!("Scheduler lease: could not get a DB connection: {e:?}");
+                            false
+                        }
+                    }
+                });
+                let was_leader = SCHEDULER_IS_LEADER.swap(leader, Ordering::Relaxed);
+                if leader && !was_leader {
+                    info!("Acquired scheduler lease (holder {}); running scheduled jobs", SCHEDULER_HOLDER_ID.as_str());
+                } else if !leader && was_leader {
+                    info!("Lost scheduler lease; this replica will not run scheduled jobs");
+                }
+
                 sched.tick();
                 runtime.block_on(tokio::time::sleep(tokio::time::Duration::from_millis(CONFIG.job_poll_interval_ms())));
             }

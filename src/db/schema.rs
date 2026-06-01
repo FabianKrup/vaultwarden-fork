@@ -351,6 +351,14 @@ table! {
     }
 }
 
+table! {
+    job_lock (id) {
+        id -> Text,
+        holder -> Text,
+        expires_at -> Timestamp,
+    }
+}
+
 joinable!(archives -> users (user_uuid));
 joinable!(archives -> ciphers (cipher_uuid));
 joinable!(attachments -> ciphers (cipher_uuid));

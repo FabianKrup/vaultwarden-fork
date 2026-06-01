@@ -60,7 +60,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 5 | ✅ **Admin rate limiter** | ~~In-memory `governor`~~ **Resolved** with #4 (`:rl:admin:` keyspace, admin knobs). | ~~Same as #4~~ Done — see roadmap step 4. | `src/ratelimit.rs` |
 | 6 | ✅ **JWT / RSA signing key** | ~~Generated on first boot, written to disk/S3~~ **Resolved:** `PRIVATE_RSA_KEY_PEM` env var injects the key; disk/S3 read + on-boot generation remain the fallback when unset. | ~~No env-injection path~~ Done — see roadmap step 1. | `src/auth.rs:63` |
 | 7 | ✅ **`config.json` runtime writes** | ~~Admin panel writes config to disk via opendal~~ **Resolved:** `IMMUTABLE_CONFIG` env flag refuses admin config writes (`post_config`/`delete_config`) and makes `Config::load` skip reading `config.json` — config becomes env-only. | ~~Write on one replica invisible to others until restart~~ Done — see roadmap step 5. Unset = behavior unchanged. | `src/config.rs` (`load` gate + `immutable_config`), `src/api/admin.rs:798,807` |
-| 8 | **tmp folder for uploads** | `save_temp_file` lands multipart uploads in local `tmp_folder` | Chunked Send upload (v2) can span requests; if they hit different replicas the partial is lost. | `src/util.rs:878`, `src/config.rs:515` |
+| 8 | ✅ **tmp folder for uploads** | `save_temp_file` streams the multipart upload straight to opendal (S3/FS) at the final path; `tmp_folder` is only Rocket's request-scoped multipart spool. | **No action needed:** uploads are single-request Direct uploads (`fileUploadType:0`) — v2 is metadata-to-DB then full-file-to-S3, both shared backends. No chunk spans replicas; local temp is never authoritative. | `src/util.rs:877`, `src/api/core/sends.rs:303,375`, `src/config.rs:515` |
 | 9 | ✅ **SQLite backup endpoint** | `/admin/config/backup_db` writes a file | **No action needed:** already gated by `CAN_BACKUP`, which is `false` whenever the DB is not SQLite, so the endpoint returns an error under external Postgres/MySQL. | `src/api/admin.rs:96-98` (gate), `src/api/admin.rs:816` (guard) |
 
 ### 3.3 Acceptable process-local caches (no change needed)
@@ -71,6 +71,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | SSO client + refresh caches | Rebuildable from config; short TTL. | `src/sso_client.rs:28` |
 | Storage operator cache | Stateless operators, reconstructable. | `src/storage.rs:55` |
 | `CONFIG`, JWT issuers, WebAuthn, HTTP client | Read-only, derived from env at boot. | `src/config.rs:37`, `src/auth.rs:44` |
+| Multipart upload temp (`tmp_folder`) | Rocket request-scoped spool; deleted after the response, never read by another replica/request. Final blob is written to shared opendal/S3. | `src/config.rs:515`, `src/util.rs:877` |
 
 ## 4. Target State (to-be)
 
@@ -81,7 +82,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 4–5 | Rate limiting | ✅ **Done.** With `REDIS_URL` set, a **Redis-backed token bucket** (atomic Lua, server `TIME` clock) shares login/admin limits across the fleet keyed by IP, matching the `governor` quota (capacity = `*_max_burst`, refill 1 every `*_ratelimit_seconds`). Shared Redis connection lives in `src/redis_conn.rs` (also backs the WS backplane). On any Redis error — or when `REDIS_URL` is unset — falls back to the per-replica in-memory `governor`. Works independently of WebSockets. |
 | 6 | JWT signing key | ✅ **Done.** Loads the private key PEM from the **`PRIVATE_RSA_KEY_PEM`** env var / secret mount; disk/S3 path remains a fallback. No runtime generation when the env var is set. |
 | 7 | Runtime config | ✅ **Done.** `IMMUTABLE_CONFIG` makes configuration **immutable and env-driven**: admin `config.json` writes are refused and `config.json` is ignored at boot, so env is the sole source of truth. Change config via env + rolling restart. |
-| 8 | Upload temp | Route multipart temp storage to **shared object storage**, or require **sticky sessions** on the chunked upload endpoints only. |
+| 8 | Upload temp | ✅ **Confirmed non-blocker.** Uploads are single-request Direct uploads streamed straight to opendal (S3) at the final path (`save_temp_file`); no chunked/resumable endpoint exists, so no partial spans replicas. `tmp_folder` is request-scoped Rocket spool on local ephemeral disk — allowed rebuildable scratch (§3.3). No code change. **Size pod ephemeral storage for (concurrent uploads × max send size, ≤525 MB).** |
 | 9 | SQLite backup | ✅ **Confirmed off.** Disabled when DB is not SQLite — already gated by `CAN_BACKUP` (`src/api/admin.rs:96-98`). No code change needed. |
 
 ### Target external dependencies
@@ -113,7 +114,7 @@ REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 3. ✅ **DB distributed lock for the scheduler** (#3) — **done.** `job_lock` lease table + `JobLock::try_acquire` (atomic CAS `UPDATE`); `schedule_jobs` (`src/main.rs`) renews the lease each tick and gates job work behind a `SCHEDULER_IS_LEADER` flag — the leader runs jobs, others only tick (keeping their per-job baseline current). Auto-expiring lease (TTL = 3× poll) handles failover; fail-closed on DB error. Always-on, no infra beyond the DB.
 4. ✅ **Redis-backed rate limiting** (#4, #5) — **done.** Token-bucket Lua keyed `{prefix}:rl:{login,admin}:{ip}` via the shared `src/redis_conn.rs` connection; matches the `governor` quota and uses Redis server `TIME` (no clock-skew). Falls back to the in-memory `governor` on Redis error or when `REDIS_URL` is unset. `redis_conn::init` opens the client lazily (only a malformed `REDIS_URL` is fatal), so the backplane no longer crashloops when Redis is down at boot — it degrades to local-only and reconnects.
 5. ✅ **Immutable config mode** (#7) — **done.** `IMMUTABLE_CONFIG` env flag refuses admin config writes (`post_config`/`delete_config`, `src/api/admin.rs`) and makes `Config::load` skip `config.json` (`src/config.rs`), so config is env-only and identical across replicas. Unset = unchanged. Note: traditional Duo 2FA deployments must set `_DUO_AKEY` via env (the auto-generated AKey is otherwise persisted to `config.json`).
-6. **Upload temp locality** (#8) — shared-storage temp or documented sticky-session requirement.
+6. ✅ **Upload temp locality** (#8) — **confirmed non-blocker.** Traced the upload path: v2 is a single-request Direct upload (`fileUploadType:0`), the file streams straight to opendal/S3 via `save_temp_file` and metadata goes to the DB — no chunked/resumable endpoint, so nothing spans replicas. `tmp_folder` is request-scoped local spool only (§3.3). No code change; only a docs note to size pod ephemeral disk for concurrent uploads (× max send size, ≤525 MB).
 7. **Docs / deploy manifests** — example k8s + env reference; ~~confirm SQLite backup is gated off (#9)~~ ✅ #9 confirmed gated by `CAN_BACKUP`.
 
 ## 6. Out of Scope / Open Questions
@@ -121,5 +122,5 @@ REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 - ~~**Rate-limit semantics**: sliding window vs token bucket — TBD.~~ ✅ Resolved: atomic token bucket (Lua) matching the `governor` quota, Redis server `TIME` as the clock.
 - **Config mode**: hard-disable admin writes vs. shared-storage + rolling-restart — to be decided when tackling #7.
 - **Redis HA**: single Redis vs. Sentinel/Cluster — deployment concern, not code.
-- **Upload locality**: shared-storage temp vs. sticky sessions — pick during #8.
+- ~~**Upload locality**: shared-storage temp vs. sticky sessions — pick during #8.~~ ✅ Resolved: no chunked upload exists; single-request uploads stream straight to S3, local temp is request-scoped only. No code change.
 - **Push relay**: external Bitwarden push relay remains optional and orthogonal to the Redis backplane.

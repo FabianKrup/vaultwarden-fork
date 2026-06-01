@@ -61,7 +61,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 6 | ✅ **JWT / RSA signing key** | ~~Generated on first boot, written to disk/S3~~ **Resolved:** `PRIVATE_RSA_KEY_PEM` env var injects the key; disk/S3 read + on-boot generation remain the fallback when unset. | ~~No env-injection path~~ Done — see roadmap step 1. | `src/auth.rs:63` |
 | 7 | **`config.json` runtime writes** | Admin panel writes config to disk via opendal | Config read once into immutable `CONFIG` at boot; a write on one replica is invisible to others until restart. | `src/config.rs:1440`, `src/api/admin.rs:797` |
 | 8 | **tmp folder for uploads** | `save_temp_file` lands multipart uploads in local `tmp_folder` | Chunked Send upload (v2) can span requests; if they hit different replicas the partial is lost. | `src/util.rs:878`, `src/config.rs:515` |
-| 9 | **SQLite backup endpoint** | `/admin/config/backup_db` writes a file | Only meaningful for SQLite; N/A under external DB. | `src/db/mod.rs:404`, `src/api/admin.rs:814` |
+| 9 | ✅ **SQLite backup endpoint** | `/admin/config/backup_db` writes a file | **No action needed:** already gated by `CAN_BACKUP`, which is `false` whenever the DB is not SQLite, so the endpoint returns an error under external Postgres/MySQL. | `src/api/admin.rs:96-98` (gate), `src/api/admin.rs:816` (guard) |
 
 ### 3.3 Acceptable process-local caches (no change needed)
 
@@ -82,7 +82,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 6 | JWT signing key | ✅ **Done.** Loads the private key PEM from the **`PRIVATE_RSA_KEY_PEM`** env var / secret mount; disk/S3 path remains a fallback. No runtime generation when the env var is set. |
 | 7 | Runtime config | Treat configuration as **immutable and env-driven**. Disable / make read-only the admin `config.json` write path under a stateless flag (or require a rolling restart to pick up shared-storage config). |
 | 8 | Upload temp | Route multipart temp storage to **shared object storage**, or require **sticky sessions** on the chunked upload endpoints only. |
-| 9 | SQLite backup | Disabled / hidden when DB is not SQLite (already gated by `CAN_BACKUP`). No action beyond confirming it's off. |
+| 9 | SQLite backup | ✅ **Confirmed off.** Disabled when DB is not SQLite — already gated by `CAN_BACKUP` (`src/api/admin.rs:96-98`). No code change needed. |
 
 ### Target external dependencies
 
@@ -114,7 +114,7 @@ REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 4. **Redis-backed rate limiting** (#4, #5) — correctness across the fleet.
 5. **Immutable config mode** (#7) — flag to disable admin config writes.
 6. **Upload temp locality** (#8) — shared-storage temp or documented sticky-session requirement.
-7. **Docs / deploy manifests** — example k8s + env reference; confirm SQLite backup is gated off (#9).
+7. **Docs / deploy manifests** — example k8s + env reference; ~~confirm SQLite backup is gated off (#9)~~ ✅ #9 confirmed gated by `CAN_BACKUP`.
 
 ## 6. Out of Scope / Open Questions
 

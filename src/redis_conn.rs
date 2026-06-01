@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::Duration};
 
 use tokio::sync::Mutex;
 
@@ -52,7 +52,17 @@ pub async fn manager() -> Option<redis::aio::ConnectionManager> {
     if let Some(mgr) = guard.as_ref() {
         return Some(mgr.clone());
     }
-    match redis::aio::ConnectionManager::new(client.clone()).await {
+    // Bound the connect and per-command timeouts so a down or black-holed Redis fails fast and the
+    // caller falls back to the in-memory limiter. The default config has *no* connection timeout
+    // (can hang indefinitely on a firewalled host) and ~6s of retry backoff; both would be held
+    // under this lock and stall the login hot path. A cached manager self-heals via its own
+    // reconnection, so the low retry count here only bounds the cold-build attempt.
+    let config = redis::aio::ConnectionManagerConfig::new()
+        .set_number_of_retries(1)
+        .set_max_delay(250)
+        .set_connection_timeout(Duration::from_secs(2))
+        .set_response_timeout(Duration::from_secs(2));
+    match redis::aio::ConnectionManager::new_with_config(client.clone(), config).await {
         Ok(mgr) => {
             *guard = Some(mgr.clone());
             Some(mgr)

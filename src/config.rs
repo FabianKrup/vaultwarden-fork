@@ -523,7 +523,7 @@ make_config! {
     ws {
         /// Enable websocket notifications
         enable_websocket:       bool,   false,  def,    true;
-        /// Redis backplane URL |> Redis connection URL enabling the multi-replica WebSocket pub/sub backplane. When unset, notifications stay process-local (single-instance only).
+        /// Redis URL |> Redis connection URL enabling multi-replica features: the WebSocket pub/sub backplane and shared rate limiting. When unset, both stay process-local (single-instance only).
         redis_url:              String, false,  option;
         /// Redis channel prefix |> Namespacing prefix for the backplane pub/sub channels.
         redis_channel_prefix:   String, false,  def,    "vw".to_owned();

@@ -186,7 +186,7 @@ async fn sso_login(
     AuthMethod::Sso.check_scope(data.scope.as_ref())?;
 
     // Ratelimit the login
-    crate::ratelimit::check_limit_login(&ip.ip)?;
+    crate::ratelimit::check_limit_login(&ip.ip).await?;
 
     let (code, code_verifier) = match (data.code.as_ref(), data.code_verifier.as_ref()) {
         (None, _) => err!(
@@ -356,7 +356,7 @@ async fn password_login(
     AuthMethod::Password.check_scope(data.scope.as_ref())?;
 
     // Ratelimit the login
-    crate::ratelimit::check_limit_login(&ip.ip)?;
+    crate::ratelimit::check_limit_login(&ip.ip).await?;
 
     // Get the user
     let username = data.username.as_ref().unwrap().trim();
@@ -569,7 +569,7 @@ async fn authenticated_response(
 
 async fn api_key_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, ip: &ClientIp) -> JsonResult {
     // Ratelimit the login
-    crate::ratelimit::check_limit_login(&ip.ip)?;
+    crate::ratelimit::check_limit_login(&ip.ip).await?;
 
     // Validate scope
     match data.scope.as_ref() {

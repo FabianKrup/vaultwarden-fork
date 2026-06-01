@@ -182,7 +182,7 @@ struct LoginForm {
 }
 
 #[post("/", format = "application/x-www-form-urlencoded", data = "<data>")]
-fn post_admin_login(
+async fn post_admin_login(
     data: Form<LoginForm>,
     cookies: &CookieJar<'_>,
     ip: ClientIp,
@@ -191,7 +191,7 @@ fn post_admin_login(
     let data = data.into_inner();
     let redirect = data.redirect;
 
-    if crate::ratelimit::check_limit_admin(&ip.ip).is_err() {
+    if crate::ratelimit::check_limit_admin(&ip.ip).await.is_err() {
         return Err(AdminResponse::TooManyRequests(render_admin_login(
             Some("Too many requests, try again later."),
             redirect.as_deref(),

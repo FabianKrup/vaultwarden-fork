@@ -45,7 +45,7 @@ async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: Client
     }
 
     // Ratelimit the login
-    crate::ratelimit::check_limit_login(&client_headers.ip.ip)?;
+    crate::ratelimit::check_limit_login(&client_headers.ip.ip).await?;
 
     // Get the user
     let email = match &data.email {

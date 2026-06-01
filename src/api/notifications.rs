@@ -51,7 +51,6 @@ enum WsChannel {
 }
 
 struct RedisBackplane {
-    publisher: redis::aio::ConnectionManager,
     user_channel: String,
     anon_channel: String,
 }
@@ -726,27 +725,28 @@ async fn publish_ws(channel: WsChannel, target: &str, payload: &[u8]) {
     let Some(backplane) = REDIS_BACKPLANE.get() else {
         return;
     };
+    // Skip publishing when Redis is unreachable; the message was already delivered locally.
+    let Some(mut conn) = crate::redis_conn::manager().await else {
+        return;
+    };
     let chan = match channel {
         WsChannel::User => &backplane.user_channel,
         WsChannel::Anonymous => &backplane.anon_channel,
     };
 
     let envelope = encode_envelope(target, payload);
-    let mut conn = backplane.publisher.clone();
     if let Err(e) = redis::cmd("PUBLISH").arg(chan).arg(envelope).query_async::<()>(&mut conn).await {
         error!("Failed to publish WS update to Redis: {e}");
     }
 }
 
-// Initializes the Redis backplane when REDIS_URL is set. Fails the boot if Redis is
-// configured but unreachable so the orchestrator restarts the pod until it is. The
-// subscriber task reconnects on its own for transient runtime errors.
+// Starts the Redis backplane when REDIS_URL is set and WebSockets are enabled. The shared client
+// (redis_conn) opens lazily, so a Redis outage at boot is non-fatal: the subscriber task below
+// reconnects on its own once Redis returns.
 pub async fn start_backplane() -> Result<(), Error> {
-    use std::io::Error as IoError;
-
-    let Some(url) = CONFIG.redis_url() else {
+    if !crate::redis_conn::is_enabled() {
         return Ok(());
-    };
+    }
     if !CONFIG.enable_websocket() {
         info!("REDIS_URL is set but WebSockets are disabled; backplane not started.");
         return Ok(());
@@ -756,12 +756,8 @@ pub async fn start_backplane() -> Result<(), Error> {
     let user_channel = format!("{prefix}:ws:user");
     let anon_channel = format!("{prefix}:ws:anonymous");
 
-    let client = redis::Client::open(url).map_err(IoError::other)?;
-    let publisher = redis::aio::ConnectionManager::new(client.clone()).await.map_err(IoError::other)?;
-
     if REDIS_BACKPLANE
         .set(RedisBackplane {
-            publisher,
             user_channel: user_channel.clone(),
             anon_channel: anon_channel.clone(),
         })
@@ -770,16 +766,18 @@ pub async fn start_backplane() -> Result<(), Error> {
         err!("Redis backplane must only be initialized once");
     }
 
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = run_subscriber(&client, &user_channel, &anon_channel).await {
-                error!("Redis WS subscriber disconnected: {e}. Reconnecting in 5s.");
+    if let Some(client) = crate::redis_conn::client() {
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = run_subscriber(&client, &user_channel, &anon_channel).await {
+                    error!("Redis WS subscriber disconnected: {e}. Reconnecting in 5s.");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
+        });
+    }
 
-    info!("Redis WebSocket backplane connected (origin {})", *WS_ORIGIN_ID);
+    info!("Redis WebSocket backplane enabled (origin {})", *WS_ORIGIN_ID);
     Ok(())
 }
 

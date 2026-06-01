@@ -58,6 +58,7 @@ mod db;
 mod http_client;
 mod mail;
 mod ratelimit;
+mod redis_conn;
 mod sso;
 mod sso_client;
 mod storage;
@@ -604,6 +605,9 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
     CONFIG.set_rocket_shutdown_handle(instance.shutdown());
 
     spawn_shutdown_signal_handler();
+
+    // Open the shared Redis client (no-op when REDIS_URL is unset; fatal only on a malformed URL).
+    redis_conn::init()?;
 
     // Start the Redis WebSocket backplane for multi-replica fan-out (no-op when REDIS_URL is unset).
     api::start_ws_backplane().await?;

@@ -609,6 +609,15 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
     // Open the shared Redis client (no-op when REDIS_URL is unset; fatal only on a malformed URL).
     redis_conn::init()?;
 
+    // IMMUTABLE_CONFIG signals stateless / multi-replica intent. Without Redis the rate limiter
+    // and WebSocket fan-out silently fall back to per-replica state, which is not HA-safe.
+    if CONFIG.immutable_config() && !redis_conn::is_enabled() {
+        warn!(
+            "IMMUTABLE_CONFIG is set but REDIS_URL is unset: login/admin rate limits and WebSocket \
+             fan-out are per-replica only. Set REDIS_URL for multi-replica HA."
+        );
+    }
+
     // Start the Redis WebSocket backplane for multi-replica fan-out (no-op when REDIS_URL is unset).
     api::start_ws_backplane().await?;
 

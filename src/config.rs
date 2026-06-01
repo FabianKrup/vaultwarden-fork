@@ -1083,6 +1083,17 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         err!("All Duo options need to be set for global Duo support")
     }
 
+    // In immutable (stateless / multi-replica) mode the AKey cannot be auto-generated:
+    // each replica would mint a different random key and persist it to a config.json that
+    // is ignored at boot, so traditional Duo signatures fail whenever the auth request and
+    // its callback land on different replicas. Require an explicit shared key instead.
+    if cfg.immutable_config && cfg._enable_duo && cfg._duo_akey.is_none() {
+        err!(
+            "`_DUO_AKEY` must be set when `IMMUTABLE_CONFIG` and Duo 2FA are enabled \
+             (the auto-generated AKey differs per replica and breaks cross-replica Duo)"
+        )
+    }
+
     if cfg.sso_enabled {
         if cfg.sso_client_id.is_empty() || cfg.sso_client_secret.is_empty() || cfg.sso_authority.is_empty() {
             err!("`SSO_CLIENT_ID`, `SSO_CLIENT_SECRET` and `SSO_AUTHORITY` must be set for SSO support")
@@ -1455,6 +1466,12 @@ impl Config {
     }
 
     pub async fn update_config(&self, other: ConfigBuilder, ignore_non_editable: bool) -> Result<(), Error> {
+        // Refuse any runtime config.json write in immutable (stateless) mode: the file is ignored
+        // at boot and writing it would diverge across replicas. Configuration is env-only here.
+        if self.inner.read().unwrap().config.immutable_config {
+            err!("Configuration is immutable (IMMUTABLE_CONFIG=true); cannot persist config changes")
+        }
+
         // Remove default values
         //let builder = other.remove(&self.inner.read().unwrap()._env);
 

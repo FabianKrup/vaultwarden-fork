@@ -62,6 +62,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 7 | ✅ **`config.json` runtime writes** | ~~Admin panel writes config to disk via opendal~~ **Resolved:** `IMMUTABLE_CONFIG` env flag refuses admin config writes (`post_config`/`delete_config`) and makes `Config::load` skip reading `config.json` — config becomes env-only. | ~~Write on one replica invisible to others until restart~~ Done — see roadmap step 5. Unset = behavior unchanged. | `src/config.rs` (`load` gate + `immutable_config`), `src/api/admin.rs:798,807` |
 | 8 | ✅ **tmp folder for uploads** | `save_temp_file` streams the multipart upload straight to opendal (S3/FS) at the final path; `tmp_folder` is only Rocket's request-scoped multipart spool. | **No action needed:** uploads are single-request Direct uploads (`fileUploadType:0`) — v2 is metadata-to-DB then full-file-to-S3, both shared backends. No chunk spans replicas; local temp is never authoritative. | `src/util.rs:877`, `src/api/core/sends.rs:303,375`, `src/config.rs:515` |
 | 9 | ✅ **SQLite backup endpoint** | `/admin/config/backup_db` writes a file | **No action needed:** already gated by `CAN_BACKUP`, which is `false` whenever the DB is not SQLite, so the endpoint returns an error under external Postgres/MySQL. | `src/api/admin.rs:96-98` (gate), `src/api/admin.rs:816` (guard) |
+| 10 | ⚠️ **Native Redis Cluster** | `redis_conn` opens a standalone `redis::Client` + `ConnectionManager`; the WS backplane uses standard pub/sub. | Works with a **single logical endpoint** only (managed Redis / Sentinel-behind-proxy). A native multi-shard **Redis Cluster** needs client-side MOVED/ASK routing (`redis::cluster::ClusterClient`) + sharded pub/sub — neither supported today. **Optional:** only required if the deployment targets native Cluster. | `src/redis_conn.rs`, `src/api/notifications.rs` |
 
 ### 3.3 Acceptable process-local caches (no change needed)
 
@@ -84,6 +85,7 @@ Maturity legend: **Stable** = long-standing / default-built · **New** = recentl
 | 7 | Runtime config | ✅ **Done.** `IMMUTABLE_CONFIG` makes configuration **immutable and env-driven**: admin `config.json` writes are refused and `config.json` is ignored at boot, so env is the sole source of truth. Change config via env + rolling restart. |
 | 8 | Upload temp | ✅ **Confirmed non-blocker.** Uploads are single-request Direct uploads streamed straight to opendal (S3) at the final path (`save_temp_file`); no chunked/resumable endpoint exists, so no partial spans replicas. `tmp_folder` is request-scoped Rocket spool on local ephemeral disk — allowed rebuildable scratch (§3.3). No code change. **Size pod ephemeral storage for (concurrent uploads × max send size, ≤525 MB).** |
 | 9 | SQLite backup | ✅ **Confirmed off.** Disabled when DB is not SQLite — already gated by `CAN_BACKUP` (`src/api/admin.rs:96-98`). No code change needed. |
+| 10 | Native Redis Cluster | ⚠️ **Optional / not done.** Standalone client already covers a single logical endpoint (managed Redis / Sentinel-behind-proxy). For a native multi-shard Cluster: swap `redis_conn` to `redis::cluster::ClusterClient` and use sharded pub/sub in the backplane. Not required unless targeting native Cluster. |
 
 ### Target external dependencies
 
@@ -116,11 +118,12 @@ REDIS_URL=redis://...                # WebSocket backplane + rate limiting
 5. ✅ **Immutable config mode** (#7) — **done.** `IMMUTABLE_CONFIG` env flag refuses admin config writes (`post_config`/`delete_config`, `src/api/admin.rs`) and makes `Config::load` skip `config.json` (`src/config.rs`), so config is env-only and identical across replicas. Unset = unchanged. Note: traditional Duo 2FA deployments must set `_DUO_AKEY` via env (the auto-generated AKey is otherwise persisted to `config.json`).
 6. ✅ **Upload temp locality** (#8) — **confirmed non-blocker.** Traced the upload path: v2 is a single-request Direct upload (`fileUploadType:0`), the file streams straight to opendal/S3 via `save_temp_file` and metadata goes to the DB — no chunked/resumable endpoint, so nothing spans replicas. `tmp_folder` is request-scoped local spool only (§3.3). No code change; only a docs note to size pod ephemeral disk for concurrent uploads (× max send size, ≤525 MB).
 7. **Docs / deploy manifests** — example k8s + env reference; ~~confirm SQLite backup is gated off (#9)~~ ✅ #9 confirmed gated by `CAN_BACKUP`.
+8. **(Optional) Native Redis Cluster support** (#10) — only if targeting a multi-shard Cluster instead of a single endpoint. Swap to `redis::cluster::ClusterClient` in `src/redis_conn.rs` + sharded pub/sub in the backplane. The standalone client already covers managed Redis / Sentinel-behind-a-proxy.
 
 ## 6. Out of Scope / Open Questions
 
 - ~~**Rate-limit semantics**: sliding window vs token bucket — TBD.~~ ✅ Resolved: atomic token bucket (Lua) matching the `governor` quota, Redis server `TIME` as the clock.
-- **Config mode**: hard-disable admin writes vs. shared-storage + rolling-restart — to be decided when tackling #7.
-- **Redis HA**: single Redis vs. Sentinel/Cluster — deployment concern, not code.
+- ~~**Config mode**: hard-disable admin writes vs. shared-storage + rolling-restart — to be decided when tackling #7.~~ ✅ Resolved with #7: **hard-disable**. `IMMUTABLE_CONFIG` refuses admin config writes and ignores `config.json` at boot; change config via env + rolling restart.
+- **Redis HA**: `src/redis_conn.rs` uses a standalone `redis::Client` + `ConnectionManager`. A **single logical endpoint** (managed Redis, or Sentinel behind a proxy/VIP) is a deployment concern — no code change. **Native Redis Cluster** (client-side MOVED/ASK routing + sharded pub/sub) is *not* supported by the standalone client and would need code — tracked as blocker #10 (optional, only if targeting native Cluster).
 - ~~**Upload locality**: shared-storage temp vs. sticky sessions — pick during #8.~~ ✅ Resolved: no chunked upload exists; single-request uploads stream straight to S3, local temp is request-scoped only. No code change.
 - **Push relay**: external Bitwarden push relay remains optional and orthogonal to the Redis backplane.
